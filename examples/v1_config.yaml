@@ -1,0 +1,54 @@
+schema_version: "1.0"
+run_type: backtest
+data:
+  root: ./data
+  dataset_id: cn-demo-v1
+  start_date: 2025-01-01
+  end_date: 2025-12-31
+  verify_hashes: true
+factor:
+  cache_root: ./.zyquant/cache/factors
+  cache_policy: compute
+strategy:
+  strategies:
+    - plugin: pipeline
+      strategy_id: demo_topk
+      capital_weight: 1.0
+      schedule:
+        type: monthly
+        position: last
+      universe:
+        universe_id: DEMO
+        minimum_listed_days: 60
+        median_amount_window: 20
+      signal:
+        type: external
+        path: ./signals/demo.parquet
+        source_id: demo_signal
+        source_version: "1.0"
+      constructor:
+        type: topk_equal
+        top_k: 20
+      constraints:
+        min_cash_weight: 0.02
+        max_instrument_weight: 0.08
+        max_industry_weight: 0.30
+portfolio: {}
+execution:
+  timing: next_open
+  max_participation: 0.05
+  slippage_bps: 2.0
+  impact_coefficient_bps: 50.0
+  max_impact_bps: 100.0
+account:
+  initial_cash: 10000000
+analysis:
+  attribution: false
+  report: true
+search:
+  enabled: false
+seed: 20260722
+output_root: ./runs
+experiment_database: ./runs/experiments.sqlite
+metadata:
+  owner: research-team

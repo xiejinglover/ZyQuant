@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zyquant"
+version = "2.0.0"
+description = "Lightweight, reproducible daily-frequency quant research framework"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "numpy>=2.0",
+  "scipy>=1.11",
+  "psutil>=5.9",
+  "pandas>=2.2",
+  "pyarrow>=18",
+  "pydantic>=2.10",
+  "PyYAML>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/xiejinglover/ZyQuant"
+Repository = "https://github.com/xiejinglover/ZyQuant"
+Issues = "https://github.com/xiejinglover/ZyQuant/issues"
+
+[project.optional-dependencies]
+ml = ["scikit-learn>=1.5"]
+optimize = ["optuna>=4.0"]
+sql = ["SQLAlchemy>=2.0"]
+hermes = ["PyMySQL>=1.1,<2", "psutil>=5.9"]
+jqdata = ["jqdatasdk>=1.9.8,<2"]
+connectors = [
+  "PyMySQL>=1.1,<2",
+  "jqdatasdk>=1.9.8,<2",
+  "SQLAlchemy>=2.0",
+]
+dev = ["pytest>=8.0", "ruff>=0.9,<0.16", "mypy>=1.13"]
+
+[project.scripts]
+zyq = "zyquant.cli:main"
+
+[project.entry-points."zyquant.data"]
+canonical-directory = "zyquant.connectors.directory:create_adapter"
+hermes = "zyquant.connectors.hermes:create_adapter"
+jqdata = "zyquant.connectors.jqdata:create_adapter"
+sql = "zyquant.connectors.sql:create_adapter"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["zyquant*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["zyquant"]
+ignore_missing_imports = true
+no_site_packages = true
+
+[[tool.mypy.overrides]]
+module = [
+  "numpy", "numpy.*", "pandas", "pandas.*",
+  "pyarrow", "pyarrow.*", "sklearn", "sklearn.*",
+]
+follow_imports = "skip"

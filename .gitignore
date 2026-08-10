@@ -1,0 +1,43 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+runs/
+data/
+outputs/
+strategies/
+.zyquant/
+.backup/
+cache/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+# Credentials live outside the repository; these patterns are a second line of
+# defence in case one is ever created here by mistake.
+.env
+*.env
+!*.env.example
+
+# Local operating instructions contain private infrastructure details and are
+# not part of the public framework source distribution.
+AGENTS.md
+
+# Concrete research strategies and their private regression material are not
+# part of the public framework repository.
+tests/test_dividend*.py
+tests/test_core_satellite*.py
+tests/test_joinquant_*_beta_script.py
+scripts/diagnose_dlv_single_quarter.py
+scripts/profile_one_dlv_backtest.py
+scripts/run_dlv_parameter_search_v2.sh
+scripts/run_dlv_quality_experiments.py
+scripts/summarize_dlv_quality_experiments.py
+scripts/rebuild_actions_and_names.py
+docs/DLV-V1.7多周期质量因子实验报告.md
+docs/因子对拍报告.md
