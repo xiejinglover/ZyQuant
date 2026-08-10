@@ -16,27 +16,51 @@ ZyQuant 是面向中国股票和 ETF 日频研究的轻量量化框架。核心�
 - 声明式因子 DAG、内容缓存、ML 数据集/滚动训练/模型登记；
 - 标准策略流水线、显式状态、严格组合约束和可插拔算法；
 - 主账户与多袖套守恒、内部交叉、T+1、公司行动和历史市场费率；
-- 标准账本、绩效/归因、原子实验产物、可恢复回测与多进程搜索。
+- 标准账本、绩效/归因、原子实验产物与多进程搜索。
 - 可选的版本化财务报表、基本面指标、每日估值和历史股本 PIT 数据。
 - Hermes 只读断点采集、沪深北 A 股、配股复权、流式标准化与原子发布。
 
+## 安装
+
+需要 Python 3.11 或更高版本。普通用户建议在独立虚拟环境中直接安装
+[GitHub Release](https://github.com/xiejinglover/ZyQuant/releases/tag/v2.0.0) 的 wheel：
+
 ```bash
-python -m pip install zyquant-2.0.0-py3-none-any.whl
-python -m unittest discover -s tests -v
-zyq --help
-zyq data --help
-zyq config validate --config examples/v1_config.yaml
-python benchmarks/benchmark_search.py
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install \
+  "https://github.com/xiejinglover/ZyQuant/releases/download/v2.0.0/zyquant-2.0.0-py3-none-any.whl"
 ```
 
-核心数据契约与供应商无关。wheel 内置规范目录、Hermes、JQData 和 SQL
-连接器，供应商 SDK 按需安装：
+验证安装：
 
 ```bash
-python -m pip install 'zyquant[hermes]'
-python -m pip install 'zyquant[jqdata]'
-python -m pip install 'zyquant[sql]'
+python -c "import zyquant; print(zyquant.__version__)"
+zyq --help
 zyq data sources
+```
+
+核心数据契约与供应商无关。wheel 已包含规范目录、Hermes、JQData 和 SQL
+连接器代码；只有实际使用的供应商 SDK 需要通过 extra 安装：
+
+```bash
+WHEEL_URL="https://github.com/xiejinglover/ZyQuant/releases/download/v2.0.0/zyquant-2.0.0-py3-none-any.whl"
+
+python -m pip install "zyquant[hermes] @ ${WHEEL_URL}"
+python -m pip install "zyquant[jqdata] @ ${WHEEL_URL}"
+python -m pip install "zyquant[sql] @ ${WHEEL_URL}"
+# 一次安装全部可选连接器：
+python -m pip install "zyquant[connectors] @ ${WHEEL_URL}"
+```
+
+参与框架开发时才需要获取源码：
+
+```bash
+git clone https://github.com/xiejinglover/ZyQuant.git
+cd ZyQuant
+python -m pip install -e '.[dev]'
+python -m pytest -q
 ```
 
 全量 A 股的权威来源是 Hermes，凭据只从 `HERMES_MYSQL_*` 环境变量读取。
@@ -45,7 +69,8 @@ zyq data sources
 JQData 适配器保留用于显式的小样本数据发布，凭据只从环境变量读取：
 
 ```bash
-python -m pip install -e '.[jqdata]'
+WHEEL_URL="https://github.com/xiejinglover/ZyQuant/releases/download/v2.0.0/zyquant-2.0.0-py3-none-any.whl"
+python -m pip install "zyquant[jqdata] @ ${WHEEL_URL}"
 export JQDATA_USERNAME='<account>'
 export JQDATA_PASSWORD='<password>'
 zyq data publish \

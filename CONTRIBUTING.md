@@ -7,8 +7,10 @@
 5. 策略插件必须通过合同测试后才能发布。
 
 ```bash
-python -m pip install -e .
-python -m unittest discover -s tests -v
+python -m pip install -e '.[dev]'
+python -m pytest -q
+ruff check src tests
+mypy src/zyquant
 python -m pip check
 python -m pip wheel . --no-deps -w dist
 ```
