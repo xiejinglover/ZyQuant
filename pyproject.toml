@@ -33,6 +33,7 @@ Issues = "https://github.com/xiejinglover/ZyQuant/issues"
 
 [project.optional-dependencies]
 ml = ["scikit-learn>=1.5"]
+ml-ranking = ["xgboost>=2.1,<4"]
 optimize = ["optuna>=4.0"]
 sql = ["SQLAlchemy>=2.0"]
 hermes = ["PyMySQL>=1.1,<2", "psutil>=5.9"]

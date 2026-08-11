@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -75,6 +76,36 @@ def _open_cohorts(
     return pd.DataFrame(rows)
 
 
+def _yearly_performance(nav: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
+    if nav.empty or not {"date", "nav"} <= set(nav):
+        return pd.DataFrame(), {}
+    working = nav[["date", "nav"]].copy().sort_values("date", kind="mergesort")
+    working["date"] = pd.to_datetime(working["date"])
+    working["return"] = working["nav"].pct_change().fillna(0.0)
+    rows = []
+    for year, group in working.groupby(working["date"].dt.year, sort=True):
+        returns = group["return"]
+        curve = (1.0 + returns).cumprod()
+        drawdown = curve / curve.cummax() - 1.0
+        volatility = float(returns.std(ddof=0))
+        rows.append({
+            "year": int(year),
+            "sessions": len(group),
+            "return": float(curve.iloc[-1] - 1.0),
+            "sharpe": (
+                float(returns.mean() / volatility * math.sqrt(252.0))
+                if volatility > 0 else 0.0
+            ),
+            "max_drawdown": float(drawdown.min()),
+        })
+    all_returns = working["return"]
+    trimmed = {}
+    for count in (10, 20):
+        keep = all_returns.drop(index=all_returns.nlargest(min(count, len(all_returns))).index)
+        trimmed[f"return_without_best_{count}_days"] = float((1.0 + keep).prod() - 1.0)
+    return pd.DataFrame(rows), trimmed
+
+
 class MomentumReport:
     def write(
         self,
@@ -90,6 +121,7 @@ class MomentumReport:
         positions = frames.get("positions", pd.DataFrame())
         nav = frames.get("nav", pd.DataFrame())
         open_cohorts = _open_cohorts(states, positions, fills)
+        yearly_performance, trimmed_performance = _yearly_performance(nav)
 
         fill_summary = pd.DataFrame()
         if not fills.empty:
@@ -149,6 +181,7 @@ class MomentumReport:
                     (net_pnl + costs) / float(metrics["initial_cash"])
                 ),
             })
+        execution_metrics.update(trimmed_performance)
         targets = frames.get("target_events", pd.DataFrame())
         retry_distribution = pd.DataFrame()
         if not targets.empty:
@@ -194,6 +227,7 @@ class MomentumReport:
             f"<p>运行 ID：{html.escape(str(manifest.get('run_id', '')))}</p>"
             f"<h2>绩效指标</h2><table>{metric_rows}</table>"
             f"<h2>策略执行指标</h2><table>{execution_rows}</table>"
+            f"<h2>2015–2026逐年绩效</h2>{_table(yearly_performance)}"
             f"<h2>日度 EMA20 池与预测覆盖</h2>{_table(decisions)}"
             f"<h2>执行与延期原因</h2>{_table(fill_summary)}"
             f"<h2>未成交与部分成交原因</h2>{_table(residual_summary)}"

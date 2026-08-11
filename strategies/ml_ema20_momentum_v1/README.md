@@ -66,3 +66,18 @@ cd /data/zzh/ZyQuant
 标签为 `close_post[T+2] / open_post[T+1] - 1`。正式 labeled panel 和各年 fold
 同时剔除无效标签以及任一模型特征为 NaN/±Inf 的行。
 `excluded_samples.parquet` 只保留被排除的键和原因，不是可训练面板。
+
+## XGBoost 3年训练 / 1年样本外滚动训练
+
+```bash
+/data/zzh/envs/zyquant-2.0/bin/python -P \
+  /data/zzh/ZyQuant/strategies/ml_ema20_momentum_v1/train_xgb_walkforward.py \
+  --dataset-root /data/zzh/ZyQuant/runs/ml_ema20_momentum_v1/datasets/rolling_3y_1y_v2_clean \
+  --model-output /data/zzh/ZyQuant/runs/ml_ema20_momentum_v1/models/xgb_ranker_3y1y_v1 \
+  --prediction-output /data/zzh/ZyQuant/runs/ml_ema20_momentum_v1/predictions/xgb_ranker_3y1y_v1.parquet \
+  --device auto --first-test-year 2015 --last-test-year 2026
+```
+
+训练入口使用每日 EMA20 事件池内去极值与 percentile rank，以0–4档
+relevance 训练 `XGBRanker(rank:ndcg)`。正式预测生成后，使用
+`server_backtest_xgb_2015_2026.yaml` 运行2015–2026滚动回测。
