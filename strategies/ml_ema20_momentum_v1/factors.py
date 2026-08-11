@@ -133,6 +133,7 @@ def _weighted_momentum(values: np.ndarray, window: int) -> tuple[np.ndarray, ...
 
     residual = np.full(len(values), np.nan)
     total = np.full(len(values), np.nan)
+    total_tolerance = np.full(len(values), np.nan)
     if len(values) >= window:
         windows = np.lib.stride_tricks.sliding_window_view(y, window)
         valid_slope = slope[window - 1:]
@@ -145,9 +146,20 @@ def _weighted_momentum(values: np.ndarray, window: int) -> tuple[np.ndarray, ...
         total[window - 1:] = np.sum(
             weights * (windows - means[:, None]) ** 2, axis=1
         )
-    r2 = np.where(total > 0, 1.0 - residual / total, 0.0)
+        scale = np.maximum(1.0, np.max(np.abs(windows), axis=1) ** 2)
+        total_tolerance[window - 1:] = (
+            np.finfo(float).eps * weights.sum() * scale
+        )
+    r2 = np.full(len(values), np.nan)
+    positive_total = np.isfinite(total) & (total > total_tolerance)
+    ratio = np.full(len(values), np.nan)
+    np.divide(residual, total, out=ratio, where=positive_total)
+    r2[positive_total] = 1.0 - ratio[positive_total]
+    r2[np.isfinite(total) & ~positive_total] = 0.0
     exponent = slope * ANNUALIZATION_DAYS
-    annualized = np.where(exponent < 709, np.expm1(exponent), np.nan)
+    annualized = np.full(len(values), np.nan)
+    safe_exponent = np.isfinite(exponent) & (exponent < 709)
+    annualized[safe_exponent] = np.expm1(exponent[safe_exponent])
     score = annualized * r2
     return annualized, r2, score, slope
 
@@ -237,11 +249,15 @@ def _one_instrument(group: pd.DataFrame) -> pd.DataFrame:
         np.isfinite(annualized), (annualized > 20).astype(float), np.nan
     )
     previous_score = pd.Series(score).shift(1).to_numpy()
-    output["score_ratio"] = np.where(
-        ~np.isfinite(score), np.nan,
-        np.where(~np.isfinite(previous_score) | (previous_score == 0), 1.0,
-                 score / previous_score),
+    score_ratio = np.full(len(group), np.nan)
+    current_score = np.isfinite(score)
+    default_ratio = current_score & (
+        ~np.isfinite(previous_score) | (previous_score == 0)
     )
+    score_ratio[default_ratio] = 1.0
+    divisible = current_score & np.isfinite(previous_score) & (previous_score != 0)
+    np.divide(score, previous_score, out=score_ratio, where=divisible)
+    output["score_ratio"] = score_ratio
     output["score_diff"] = np.where(
         ~np.isfinite(score), np.nan,
         np.where(~np.isfinite(previous_score), 0.0, score - previous_score),

@@ -200,3 +200,24 @@ def test_all_49_factors_are_finite_and_exclude_beijing_and_b_shares(tmp_path):
         assert set(result["instrument_id"]) == {SHARE}
         values = pd.to_numeric(result["value"], errors="coerce").dropna()
         assert np.isfinite(values).all(), factor.name
+
+
+def test_constant_price_has_zero_r2_without_division_warnings():
+    from strategies.ml_ema20_momentum_v1.factors import _one_instrument
+
+    count = 70
+    frame = pd.DataFrame({
+        "trade_date": [item.date() for item in pd.bdate_range("2024-01-02", periods=count)],
+        "instrument_id": SHARE,
+        "open_post": 10.0,
+        "high_post": 10.0,
+        "low_post": 10.0,
+        "close_post": 10.0,
+        "volume": 1_000_000.0,
+        "amount": 10_000_000.0,
+    })
+    with np.errstate(all="raise"):
+        result = _one_instrument(frame)
+    assert result.iloc[-1]["r2"] == 0.0
+    assert result.iloc[-1]["score"] == 0.0
+    assert result.iloc[-1]["score_ratio"] == 1.0
