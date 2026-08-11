@@ -39,8 +39,8 @@ class Ema20MomentumStrategy:
         instrument_weight: float = 0.15,
         cash_buffer: float = 0.01,
         ema_span: int = 20,
-        minimum_listed_sessions: int = 60,
-        minimum_price: float = 3.0,
+        minimum_listed_sessions: int = 120,
+        minimum_price: float | None = None,
         minimum_median_amount: float = 50_000_000.0,
     ):
         if top_k < 1:
@@ -58,7 +58,9 @@ class Ema20MomentumStrategy:
         self.cash_buffer = float(cash_buffer)
         self.ema_span = int(ema_span)
         self.minimum_listed_sessions = int(minimum_listed_sessions)
-        self.minimum_price = float(minimum_price)
+        self.minimum_price = (
+            float(minimum_price) if minimum_price is not None else None
+        )
         self.minimum_median_amount = float(minimum_median_amount)
         self.schedule = _RunWindowSchedule(self)
         self._calendar: list[date] = []

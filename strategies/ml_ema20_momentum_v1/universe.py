@@ -47,13 +47,15 @@ def build_ema20_universe(
     end: date,
     *,
     ema_span: int = 20,
-    minimum_listed_sessions: int = 60,
-    minimum_price: float = 3.0,
+    minimum_listed_sessions: int = 120,
+    minimum_price: float | None = None,
     minimum_median_amount: float = 50_000_000.0,
 ) -> Ema20UniversePanel:
     """Build a sparse PIT universe without registering framework factors."""
     if ema_span < 2 or minimum_listed_sessions < 0:
         raise ValueError("invalid EMA universe parameters")
+    if minimum_price is not None and minimum_price < 0:
+        raise ValueError("minimum_price must be non-negative or None")
     calendar = sorted(set(snapshot.table("trade_calendar")["trade_date"]))
     run_days = [day for day in calendar if start <= day <= end]
     if not run_days:
@@ -88,7 +90,7 @@ def build_ema20_universe(
     )
     raw = snapshot.raw_bars(
         history_start, end, codes,
-        ["close", "amount", "paused"], cutoff=end,
+        ["close", "amount", "volume", "paused"], cutoff=end,
     )
     if post.empty or raw.empty:
         raise DataContractError("EMA universe requires adjusted and raw bars")
@@ -136,9 +138,15 @@ def build_ema20_universe(
         alive = daily["delist_date"].isna() | (daily["delist_date"] > day)
         seasoned = daily["listed_sessions"] >= minimum_listed_sessions
         not_st = ~daily["instrument_id"].isin(_st_codes(names, day))
+        not_paused = ~daily["paused"].fillna(True).astype(bool)
+        has_volume = pd.to_numeric(daily["volume"], errors="coerce").fillna(0) > 0
+        price_ok = (
+            daily["close"] >= minimum_price
+            if minimum_price is not None
+            else pd.Series(True, index=daily.index)
+        )
         tradable = (
-            ~daily["paused"].fillna(True).astype(bool)
-            & (daily["close"] >= minimum_price)
+            not_paused & has_volume & price_ok
             & (daily["median_amount"] >= minimum_median_amount)
         )
         ready = daily[[
@@ -163,13 +171,14 @@ def build_ema20_universe(
             "excluded_paused": int(
                 (alive & seasoned & not_st & daily["paused"].fillna(True).astype(bool)).sum()
             ),
-            "excluded_price": int(
-                (alive & seasoned & not_st & ~daily["paused"].fillna(True).astype(bool)
-                 & (daily["close"] < minimum_price)).sum()
+            "excluded_zero_volume": int(
+                (alive & seasoned & not_st & not_paused & ~has_volume).sum()
             ),
+            "excluded_price": int((
+                alive & seasoned & not_st & not_paused & has_volume & ~price_ok
+            ).sum()),
             "excluded_liquidity_or_warmup": int(
-                (alive & seasoned & not_st & ~daily["paused"].fillna(True).astype(bool)
-                 & (daily["close"] >= minimum_price)
+                (alive & seasoned & not_st & not_paused & has_volume & price_ok
                  & ~(daily["median_amount"] >= minimum_median_amount)).sum()
             ),
             "base_pool_count": int(

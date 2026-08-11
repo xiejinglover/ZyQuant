@@ -22,8 +22,7 @@ strategy:
         instrument_weight: 0.15
         cash_buffer: 0.01
         ema_span: 20
-        minimum_listed_sessions: 60
-        minimum_price: 3.0
+        minimum_listed_sessions: 120
         minimum_median_amount: 50000000.0
 portfolio: {}
 execution:

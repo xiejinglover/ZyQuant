@@ -31,3 +31,22 @@ cd /data/zzh/ZyQuant
 ```
 
 没有真实预测文件时会直接失败，不会伪造模型输出。
+
+## 技术因子缓存
+
+策略发布 49 个 `ml_ema20_*` 单股技术因子。历史滚动窗口先删除停牌 bar，
+非停牌零成交量 bar 保留；EMA20 事件池和 20 日成交额过滤仍按交易日历计算。
+
+服务器全历史预热：
+
+```bash
+/data/zzh/envs/zyquant-2.0/bin/python -P \
+  /data/zzh/ZyQuant/strategies/ml_ema20_momentum_v1/build_factor_cache.py \
+  --root /data/zzh/ZyQuant/data \
+  --dataset hermes-cn-a-2010-20260724-v4 \
+  --cache-root /data/zzh/ZyQuant/.zyquant/cache/factors \
+  --output /data/zzh/ZyQuant/runs/ml_ema20_momentum_v1/factors
+```
+
+缓存构建只覆盖沪深普通 A 股，不输出北交所和 B 股；审计目录记录每个因子的
+定义、cache key、覆盖率和耗时。横截面排名将在后续 EMA20 事件样本中计算。

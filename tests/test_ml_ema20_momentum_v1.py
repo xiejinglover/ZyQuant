@@ -24,14 +24,14 @@ CODES = ("600001.XSHG", "600002.XSHG", "000001.XSHE", "000002.XSHE")
 
 class FakeSnapshot:
     def __init__(self, closes: dict[str, list[float]] | None = None):
-        self.days = [item.date() for item in pd.bdate_range("2024-01-02", periods=75)]
+        self.days = [item.date() for item in pd.bdate_range("2024-01-02", periods=135)]
         self.metadata = SimpleNamespace(
             dataset_id="ema-test-v1",
             fingerprint="data-fp",
             as_of_date=self.days[-1],
         )
         values = closes or {
-            code: [10.0] * 65 + [11.0] + [10.5] * 9 for code in CODES
+            code: [10.0] * 125 + [11.0] + [10.5] * 9 for code in CODES
         }
         self._post = pd.DataFrame([
             {"trade_date": day, "instrument_id": code, "close_post": close}
@@ -44,6 +44,7 @@ class FakeSnapshot:
                 "instrument_id": code,
                 "close": close,
                 "amount": 100_000_000.0,
+                "volume": 10_000_000.0,
                 "paused": False,
             }
             for code in CODES
@@ -114,10 +115,18 @@ def prediction_frame(snapshot: FakeSnapshot, day: date) -> pd.DataFrame:
 
 def test_ema20_cross_is_recursive_filtered_and_causal():
     snapshot = FakeSnapshot()
-    cross_day = snapshot.days[65]
+    cross_day = snapshot.days[125]
     panel = build_ema20_universe(snapshot, snapshot.days[0], snapshot.days[-1])
     assert panel.eligible(snapshot.days[19]) == ()
     assert panel.eligible(cross_day) == tuple(sorted(CODES))
+    before_120 = panel.diagnostics.loc[
+        panel.diagnostics["signal_date"] == snapshot.days[118]
+    ].iloc[0]
+    at_120 = panel.diagnostics.loc[
+        panel.diagnostics["signal_date"] == snapshot.days[119]
+    ].iloc[0]
+    assert before_120["excluded_insufficient_listing"] == len(CODES)
+    assert at_120["excluded_insufficient_listing"] == 0
 
     changed = FakeSnapshot()
     changed._post.loc[changed._post["trade_date"] > cross_day, "close_post"] = 99.0
@@ -135,9 +144,20 @@ def test_ema20_cross_is_recursive_filtered_and_causal():
     assert CODES[1] not in filtered.eligible(cross_day)
 
 
+def test_low_price_does_not_exclude_an_eligible_cross():
+    values = {
+        code: ([2.0] * 125 + [2.2] + [2.1] * 9) if code == CODES[0]
+        else [10.0] * 125 + [11.0] + [10.5] * 9
+        for code in CODES
+    }
+    snapshot = FakeSnapshot(values)
+    panel = build_ema20_universe(snapshot, snapshot.days[0], snapshot.days[-1])
+    assert CODES[0] in panel.eligible(snapshot.days[125])
+
+
 def test_prediction_protocol_and_stable_ranking(tmp_path):
     snapshot = FakeSnapshot()
-    day = snapshot.days[65]
+    day = snapshot.days[125]
     source = tmp_path / "predictions.parquet"
     prediction_frame(snapshot, day).to_parquet(source, index=False)
     book = PredictionBook.load(source, snapshot)
@@ -163,7 +183,7 @@ def _context(day, state, *, cash=1_000_000.0, positions=()):
 
 def test_top3_full_slots_skip_held_and_schedule_t_plus_one_two(tmp_path):
     snapshot = FakeSnapshot()
-    day = snapshot.days[65]
+    day = snapshot.days[125]
     source = tmp_path / "predictions.parquet"
     prediction_frame(snapshot, day).to_parquet(source, index=False)
     strategy = Ema20MomentumStrategy(prediction_path=source)
@@ -190,7 +210,7 @@ def test_top3_full_slots_skip_held_and_schedule_t_plus_one_two(tmp_path):
 
 def test_exit_state_retries_without_maximum_holding_period(tmp_path):
     snapshot = FakeSnapshot()
-    day = snapshot.days[67]
+    day = snapshot.days[127]
     source = tmp_path / "predictions.parquet"
     prediction_frame(snapshot, day).to_parquet(source, index=False)
     strategy = Ema20MomentumStrategy(prediction_path=source)
@@ -203,9 +223,9 @@ def test_exit_state_retries_without_maximum_holding_period(tmp_path):
     strategy._predictions = PredictionBook.load(source, snapshot)
     cohort = "old"
     state = StrategyState(payload={"cohorts": {cohort: {
-        "signal_date": snapshot.days[64].isoformat(),
-        "entry_date": snapshot.days[65].isoformat(),
-        "first_exit_date": snapshot.days[66].isoformat(),
+        "signal_date": snapshot.days[124].isoformat(),
+        "entry_date": snapshot.days[125].isoformat(),
+        "first_exit_date": snapshot.days[126].isoformat(),
         "symbols": [CODES[0]],
         "status": "exit_pending",
         "retry_count": 9999,
