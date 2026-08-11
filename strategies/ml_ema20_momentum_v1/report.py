@@ -101,6 +101,14 @@ class MomentumReport:
                     dropna=False,
                 ).size().rename("orders").reset_index()
             )
+        residuals = frames.get("demand_residuals", pd.DataFrame())
+        residual_summary = pd.DataFrame()
+        if not residuals.empty:
+            residual_summary = (
+                residuals.groupby(
+                    ["execution_phase", "side", "reason"], dropna=False,
+                )["quantity"].agg(["count", "sum"]).reset_index()
+            )
         utilization = pd.DataFrame()
         if not nav.empty and {"date", "nav", "cash"} <= set(nav):
             utilization = nav[["date", "nav", "cash"]].copy()
@@ -109,6 +117,11 @@ class MomentumReport:
             )
 
         execution_metrics: dict[str, Any] = {}
+        allocations = frames.get("fill_allocations", pd.DataFrame())
+        slippage_cost = (
+            float(allocations["slippage_cost"].sum())
+            if not allocations.empty else 0.0
+        )
         if not fills.empty:
             open_buys = fills[
                 (fills["execution_phase"] == "open") & (fills["side"] == "buy")
@@ -123,8 +136,21 @@ class MomentumReport:
                     (fills["reject_reason"] == "strategy_hold_limit_up").sum()
                 ),
                 "fees": float(fills["commission"].sum() + fills["tax"].sum()),
+                "slippage_cost": slippage_cost,
+                "actual_open_entries": int((open_buys["filled_quantity"] > 0).sum()),
+            })
+        if {"initial_cash", "final_nav"} <= set(metrics):
+            net_pnl = float(metrics["final_nav"]) - float(metrics["initial_cash"])
+            costs = float(execution_metrics.get("fees", 0.0)) + slippage_cost
+            execution_metrics.update({
+                "net_pnl": net_pnl,
+                "gross_pnl_before_execution_costs": net_pnl + costs,
+                "gross_return_before_execution_costs": (
+                    (net_pnl + costs) / float(metrics["initial_cash"])
+                ),
             })
         targets = frames.get("target_events", pd.DataFrame())
+        retry_distribution = pd.DataFrame()
         if not targets.empty:
             decoded = targets["diagnostics"].apply(json.loads)
             initial = targets[decoded.apply(lambda item: item.get("kind") == "initial_exit")]
@@ -136,6 +162,18 @@ class MomentumReport:
                 "normal_t_plus_2_exit_rate": float(normal.mean()) if len(initial) else 0.0,
                 "retry_close_targets": len(retries),
             })
+            if not retries.empty:
+                retry_distribution = (
+                    retries.groupby("cohort_id").size().rename("delay_sessions")
+                    .value_counts().sort_index().rename("cohorts").reset_index()
+                )
+        position_exposure = pd.DataFrame()
+        if not positions.empty:
+            position_exposure = positions.copy()
+            totals = position_exposure.groupby("date")["market_value"].transform("sum")
+            position_exposure["invested_weight"] = (
+                position_exposure["market_value"] / totals.where(totals != 0)
+            )
         execution_rows = "".join(
             f"<tr><th>{html.escape(str(key))}</th><td>{html.escape(str(value))}</td></tr>"
             for key, value in execution_metrics.items()
@@ -158,7 +196,10 @@ class MomentumReport:
             f"<h2>策略执行指标</h2><table>{execution_rows}</table>"
             f"<h2>日度 EMA20 池与预测覆盖</h2>{_table(decisions)}"
             f"<h2>执行与延期原因</h2>{_table(fill_summary)}"
+            f"<h2>未成交与部分成交原因</h2>{_table(residual_summary)}"
+            f"<h2>延期交易日分布</h2>{_table(retry_distribution)}"
             f"<h2>资金利用率</h2>{_table(utilization)}"
+            f"<h2>单股持仓暴露</h2>{_table(position_exposure)}"
             f"<h2>期末未关闭 cohort</h2>{_table(open_cohorts)}"
             "</body></html>",
             encoding="utf-8",
