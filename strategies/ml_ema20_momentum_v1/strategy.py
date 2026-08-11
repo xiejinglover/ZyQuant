@@ -190,6 +190,14 @@ class Ema20MomentumStrategy:
                 "retry_count": 0,
             }
 
+        universe_day = self._universe.diagnostics[
+            self._universe.diagnostics["signal_date"] == day
+        ]
+        universe_counts = {
+            str(column): int(universe_day.iloc[0][column])
+            for column in universe_day.columns
+            if column != "signal_date" and not universe_day.empty
+        }
         decision_diagnostics = {
             "signal_date": day.isoformat(),
             "base_pool_count": self._diagnostic_value(day, "base_pool_count"),
@@ -207,6 +215,9 @@ class Ema20MomentumStrategy:
             "selected": selected,
             "empty_slot_reason": reason,
             "active_cohorts": len(cohorts),
+            "universe_exclusion_counts": universe_counts,
+            "universe_fingerprint": self._universe.fingerprint,
+            "prediction_fingerprint": self._predictions.fingerprint,
         }
         payload["cohorts"] = cohorts
         payload["last_decision"] = decision_diagnostics

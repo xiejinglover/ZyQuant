@@ -25,8 +25,8 @@
 
 ```bash
 cd /data/zzh/ZyQuant
-/data/zzh/envs/zyquant-2.0/bin/python -P -m \
-  strategies.ml_ema20_momentum_v1.run_backtest \
+/data/zzh/envs/zyquant-2.0/bin/python -P \
+  /data/zzh/ZyQuant/strategies/ml_ema20_momentum_v1/run_backtest.py \
   --config /data/zzh/ZyQuant/strategies/ml_ema20_momentum_v1/server_backtest.yaml
 ```
 
