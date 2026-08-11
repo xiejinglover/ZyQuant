@@ -154,6 +154,7 @@ class Ema20MomentumStrategy:
                 scheduled.append(self._exit_target(
                     context, cohort_id, session_offset=1,
                     signal_fingerprint=f"retry-{item['retry_count']}",
+                    instruments=actual,
                 ))
 
         eligible = self._universe.eligible(day)
@@ -252,6 +253,7 @@ class Ema20MomentumStrategy:
                     signal_fingerprint=f"{self._predictions.fingerprint}:exit",
                     **{**common, "diagnostics": {
                         "kind": "initial_exit", **decision_diagnostics,
+                        "liquidate_only_instruments": selected,
                     }},
                 ),
             ])
@@ -287,6 +289,7 @@ class Ema20MomentumStrategy:
     def _exit_target(
         self, context, cohort_id: str, *, session_offset: int,
         signal_fingerprint: str,
+        instruments: Sequence[str],
     ) -> ScheduledTargetPortfolio:
         state_hash = hash_payload(context.state)
         assert self._universe is not None
@@ -294,5 +297,9 @@ class Ema20MomentumStrategy:
             self.strategy_id, context.signal_date, session_offset, "close",
             cohort_id, {}, 1.0, self._universe.fingerprint,
             signal_fingerprint, state_hash, state_hash,
-            {"kind": "retry_exit", "cohort_id": cohort_id},
+            {
+                "kind": "retry_exit",
+                "cohort_id": cohort_id,
+                "liquidate_only_instruments": list(instruments),
+            },
         )

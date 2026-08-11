@@ -60,7 +60,12 @@ def _open_cohorts(
     rows = []
     for cohort_id, raw in sorted(cohorts.items()):
         signal_date = pd.Timestamp(raw["signal_date"]).date()
-        symbols = list(map(str, raw.get("symbols", [])))
+        symbols = [
+            code for code in map(str, raw.get("symbols", []))
+            if position_map.get(code, 0.0) > 0.0
+        ]
+        if not symbols:
+            continue
         rows.append({
             "cohort_id": cohort_id,
             "signal_date": signal_date,

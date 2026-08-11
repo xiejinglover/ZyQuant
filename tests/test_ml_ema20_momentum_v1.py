@@ -8,6 +8,7 @@ import pytest
 
 from strategies.ml_ema20_momentum_v1.execution import HoldLimitUpCloseExecutor
 from strategies.ml_ema20_momentum_v1.prediction import PredictionBook
+from strategies.ml_ema20_momentum_v1.report import _open_cohorts
 from strategies.ml_ema20_momentum_v1.strategy import Ema20MomentumStrategy
 from strategies.ml_ema20_momentum_v1.universe import (
     Ema20UniversePanel,
@@ -202,6 +203,9 @@ def test_top3_full_slots_skip_held_and_schedule_t_plus_one_two(tmp_path):
     assert set(entries[0].weights.values()) == {0.15}
     assert entries[0].session_offset == 1
     assert exits[0].session_offset == 2
+    assert exits[0].diagnostics["liquidate_only_instruments"] == [
+        CODES[1], CODES[2], CODES[3],
+    ]
 
     low_cash = strategy.decide(_context(day, StrategyState(), cash=160_000.0))
     low_entry = [item for item in low_cash.scheduled_targets if item.execution_phase == "open"]
@@ -235,6 +239,22 @@ def test_exit_state_retries_without_maximum_holding_period(tmp_path):
     assert decision.next_state.payload["cohorts"][cohort]["retry_count"] == 10000
     retry = [item for item in decision.scheduled_targets if item.cohort_id == cohort]
     assert len(retry) == 1 and retry[0].session_offset == 1
+    assert retry[0].diagnostics["liquidate_only_instruments"] == [CODES[0]]
+
+
+def test_open_cohort_report_ignores_stale_state_without_position() -> None:
+    states = pd.DataFrame([{
+        "date": date(2025, 1, 3),
+        "state_json": '{"cohorts":{"old":{"signal_date":"2025-01-01",'
+        '"symbols":["600001.XSHG"],"status":"exit_pending"}}}',
+    }])
+    positions = pd.DataFrame(columns=[
+        "date", "instrument_id", "market_value",
+    ])
+    fills = pd.DataFrame(columns=[
+        "side", "reject_reason", "execution_date", "instrument_id",
+    ])
+    assert _open_cohorts(states, positions, fills).empty
 
 
 def test_hold_limit_up_close_executor_only_blocks_required_sells():
