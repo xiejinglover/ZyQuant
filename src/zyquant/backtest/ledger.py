@@ -41,6 +41,10 @@ LEDGER_COLUMNS: Mapping[str, tuple[str, ...]] = {
         "date", "strategy_id", "instrument_id", "quantity",
         "last_price", "market_value",
     ),
+    "position_lots": (
+        "date", "strategy_id", "instrument_id", "cohort_id", "quantity",
+        "acquisition_date", "sellable_date", "unit_cost",
+    ),
     "master_positions": (
         "date", "account_id", "instrument_id", "quantity",
         "last_price", "market_value",

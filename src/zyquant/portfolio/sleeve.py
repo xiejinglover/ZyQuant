@@ -44,6 +44,8 @@ def net_sleeve_demands(
                     quantity, buyer.reference_price,
                     f"{execution_date}:{phase}:{code}:cross:{seller.strategy_id}:{buyer.strategy_id}",
                     phase,
+                    seller.cohort_id,
+                    buyer.cohort_id,
                 ))
             buys[buy_index][1] -= quantity
             sells[sell_index][1] -= quantity
@@ -56,7 +58,7 @@ def net_sleeve_demands(
                 SleeveDemand(
                     item.strategy_id, item.instrument_id, item.side, int(quantity),
                     item.reference_price, item.lot_size, item.demand_id, phase,
-                    item.target_quantity,
+                    item.target_quantity, item.cohort_id,
                 )
                 for item, quantity in values if quantity > 0
             ]
@@ -106,6 +108,7 @@ def cost_allocations(
     commission: float,
     tax: float,
     slippage_bps: float,
+    cohort_by_strategy: dict[str, str | None] | None = None,
 ) -> list[FillAllocation]:
     total = sum(quantity_by_strategy.values())
     if total <= 0:
@@ -132,5 +135,6 @@ def cost_allocations(
             order.order_id, order.execution_date, strategy_id, order.instrument_id, order.side,
             quantity, price, current_commission, current_tax, current_slippage,
             f"{order.order_id}:allocation:{strategy_id}",
+            (cohort_by_strategy or {}).get(strategy_id),
         ))
     return result

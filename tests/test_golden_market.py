@@ -68,6 +68,19 @@ class GoldenMarketTests(unittest.TestCase):
         self.assertEqual(account.sellable_quantity(CODE_B, date(2025, 1, 2)), 0)
         self.assertEqual(account.sellable_quantity(CODE_B, date(2025, 1, 3)), 100)
 
+        cohort_account = SleeveAccount("cohorts", 0.0)
+        cohort_account.add_lot(PositionLot(
+            CODE_B, 100, date(2025, 1, 2), date(2025, 1, 3), 8.0,
+            "first",
+        ))
+        cohort_account.add_lot(PositionLot(
+            CODE_B, 100, date(2025, 1, 3), date(2025, 1, 6), 8.1,
+            "second",
+        ))
+        cohort_account.adjust_shares(CODE_B, 30, date(2025, 1, 6))
+        self.assertEqual(cohort_account.quantity(CODE_B, "first"), 115)
+        self.assertEqual(cohort_account.quantity(CODE_B, "second"), 115)
+
         with tempfile.TemporaryDirectory() as temporary:
             tables, days = canonical_tables()
             always_a = signal_frame(days)

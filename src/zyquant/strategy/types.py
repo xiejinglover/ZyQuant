@@ -83,6 +83,31 @@ class TargetPortfolio:
     state_before_hash: str
     state_after_hash: str
     diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    cohort_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ScheduledTargetPortfolio:
+    """A cohort-scoped target to execute on a later session and phase.
+
+    ``session_offset`` is counted from ``signal_date`` (1 means the next
+    trading session).  Targets sharing a cohort operate only on lots carrying
+    that cohort id, which allows an older cohort to exit at the close without
+    touching a new cohort entered at the same day's open.
+    """
+
+    strategy_id: str
+    signal_date: date
+    session_offset: int
+    execution_phase: str
+    cohort_id: str
+    weights: Mapping[str, float]
+    cash_weight: float
+    universe_fingerprint: str
+    signal_fingerprint: str
+    state_before_hash: str
+    state_after_hash: str
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -114,6 +139,7 @@ class StrategyDecision:
     next_state: StrategyState
     signals: SignalFrame | None
     diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    scheduled_targets: tuple[ScheduledTargetPortfolio, ...] = ()
 
 
 class RebalanceSchedule(Protocol):
@@ -152,4 +178,3 @@ class PreparableStrategy(Protocol):
         start: date,
         end: date,
     ) -> None: ...
-

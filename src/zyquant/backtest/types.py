@@ -14,6 +14,7 @@ class PositionLot:
     acquisition_date: date
     sellable_date: date
     unit_cost: float
+    cohort_id: str | None = None
 
 
 @dataclass
@@ -23,14 +24,30 @@ class SleeveAccount:
     lots: dict[str, list[PositionLot]] = field(default_factory=dict)
     receivables: dict[str, float] = field(default_factory=dict)
 
-    def quantity(self, instrument_id: str) -> int:
-        return sum(item.quantity for item in self.lots.get(instrument_id, ()))
+    def quantity(self, instrument_id: str, cohort_id: str | None = None) -> int:
+        return sum(
+            item.quantity for item in self.lots.get(instrument_id, ())
+            if cohort_id is None or item.cohort_id == cohort_id
+        )
 
-    def sellable_quantity(self, instrument_id: str, day: date) -> int:
+    def sellable_quantity(
+        self, instrument_id: str, day: date, cohort_id: str | None = None,
+    ) -> int:
         return sum(
             item.quantity for item in self.lots.get(instrument_id, ())
             if item.sellable_date <= day
+            and (cohort_id is None or item.cohort_id == cohort_id)
         )
+
+    def instruments(self, cohort_id: str | None = None) -> set[str]:
+        return {
+            code for code, lots in self.lots.items()
+            if any(
+                item.quantity > 0
+                and (cohort_id is None or item.cohort_id == cohort_id)
+                for item in lots
+            )
+        }
 
     def nav(self, prices: Mapping[str, float]) -> float:
         market = sum(self.quantity(code) * prices.get(code, 0.0) for code in self.lots)
@@ -39,11 +56,17 @@ class SleeveAccount:
     def add_lot(self, lot: PositionLot) -> None:
         self.lots.setdefault(lot.instrument_id, []).append(lot)
 
-    def remove(self, instrument_id: str, quantity: int, day: date) -> int:
+    def remove(
+        self, instrument_id: str, quantity: int, day: date,
+        cohort_id: str | None = None,
+    ) -> int:
         remaining = quantity
         lots = self.lots.get(instrument_id, [])
         for lot in sorted(lots, key=lambda item: (item.sellable_date, item.acquisition_date)):
-            if lot.sellable_date > day or remaining <= 0:
+            if (
+                lot.sellable_date > day or remaining <= 0
+                or (cohort_id is not None and lot.cohort_id != cohort_id)
+            ):
                 continue
             taken = min(lot.quantity, remaining)
             lot.quantity -= taken
@@ -62,6 +85,45 @@ class SleeveAccount:
             remaining -= taken
         self.lots[instrument_id] = [item for item in lots if item.quantity > 0]
         return quantity - remaining
+
+    def adjust_shares(
+        self, instrument_id: str, delta: int, day: date,
+    ) -> int:
+        """Apply an exact corporate-action delta while retaining cohort lineage."""
+        lots = [
+            item for item in self.lots.get(instrument_id, ())
+            if item.quantity > 0
+        ]
+        total = sum(item.quantity for item in lots)
+        if not lots or not delta:
+            return 0
+        magnitude = abs(delta)
+        if delta < 0 and magnitude > total:
+            return 0
+        raw = [magnitude * item.quantity / total for item in lots]
+        allocated = [int(value) for value in raw]
+        remaining = magnitude - sum(allocated)
+        order = sorted(
+            range(len(lots)),
+            key=lambda index: (-(raw[index] - allocated[index]), index),
+        )
+        for index in order[:remaining]:
+            allocated[index] += 1
+        for source, quantity in zip(lots, allocated, strict=True):
+            if not quantity:
+                continue
+            if delta > 0:
+                self.add_lot(PositionLot(
+                    instrument_id, quantity, day, day, 0.0,
+                    source.cohort_id,
+                ))
+            else:
+                source.quantity -= quantity
+        self.lots[instrument_id] = [
+            item for item in self.lots.get(instrument_id, ())
+            if item.quantity > 0
+        ]
+        return delta
 
 
 @dataclass
@@ -112,6 +174,7 @@ class SleeveDemand:
     demand_id: str | None = None
     execution_phase: str = "open"
     target_quantity: int | None = None
+    cohort_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +187,8 @@ class InternalCross:
     price: float
     cross_id: str | None = None
     execution_phase: str = "open"
+    seller_cohort_id: str | None = None
+    buyer_cohort_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +233,7 @@ class FillAllocation:
     tax: float
     slippage_cost: float
     allocation_id: str | None = None
+    cohort_id: str | None = None
 
 
 @dataclass(frozen=True)

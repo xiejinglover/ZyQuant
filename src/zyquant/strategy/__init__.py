@@ -9,7 +9,8 @@ from .types import (
     CandidateWeights, PortfolioConstructor,
     PortfolioView, PositionView, PreparableStrategy, RebalanceSchedule,
     SignalFrame, SignalGenerator, Strategy, StrategyContext, StrategyDecision,
-    StrategyState, TargetPortfolio, UniverseSelector, UniverseSnapshot,
+    ScheduledTargetPortfolio, StrategyState, TargetPortfolio, UniverseSelector,
+    UniverseSnapshot,
 )
 from .universe import StandardUniverseSelector
 
@@ -31,7 +32,8 @@ __all__ = [
     "CandidateWeights",
     "PortfolioConstructor", "PortfolioView", "PositionView", "RebalanceSchedule",
     "SignalFrame", "SignalGenerator", "StrategyContext", "StrategyDecision",
-    "StrategyState", "Strategy", "PreparableStrategy", "TargetPortfolio", "UniverseSelector",
+    "StrategyState", "Strategy", "PreparableStrategy", "TargetPortfolio",
+    "ScheduledTargetPortfolio", "UniverseSelector",
     "UniverseSnapshot",
     "StandardUniverseSelector", "PipelineStrategy", "DirectTargetStrategy",
 ]

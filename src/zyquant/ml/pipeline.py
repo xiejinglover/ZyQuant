@@ -73,6 +73,14 @@ class Predictor(Protocol):
 
 
 class DatasetBuilder:
+    """Build PIT feature/label panels with configurable executable prices.
+
+    The legacy default remains close-to-future-close.  For a signal produced
+    at T close, entered at T+1 open and exited at T+2 close, use
+    ``entry_offset=1``, ``horizon=1``, ``entry_price_field="open_post"`` and
+    ``exit_price_field="close_post"``.
+    """
+
     def build(
         self,
         snapshot: DataSnapshot,
@@ -82,9 +90,14 @@ class DatasetBuilder:
         horizon: int = 1,
         instruments: Sequence[str] | None = None,
         cutoff: date | None = None,
+        entry_offset: int = 0,
+        entry_price_field: str = "close_post",
+        exit_price_field: str = "close_post",
     ) -> TrainingDataset:
         if horizon < 1:
             raise ValueError("label horizon must be positive")
+        if entry_offset < 0:
+            raise ValueError("label entry offset must not be negative")
         merged = None
         for name, source in feature_frames.items():
             part = source[["trade_date", "instrument_id", "value"]].rename(
@@ -96,13 +109,24 @@ class DatasetBuilder:
         if merged is None or merged.empty:
             raise StrategyError("feature frames produced an empty dataset")
         cutoff = cutoff or end
+        price_fields = list(dict.fromkeys(
+            [entry_price_field, exit_price_field]
+        ))
         prices = snapshot.post_adjusted_bars(
-            start, end, instruments, ["close_post"], cutoff=cutoff
+            start, end, instruments, price_fields, cutoff=cutoff
         ).sort_values(["instrument_id", "trade_date"])
-        prices["label"] = prices.groupby("instrument_id")["close_post"].shift(-horizon) / prices["close_post"] - 1
-        prices["label_end_date"] = prices.groupby("instrument_id")["trade_date"].shift(-horizon)
+        grouped = prices.groupby("instrument_id", sort=False)
+        exit_offset = entry_offset + horizon
+        entry_price = grouped[entry_price_field].shift(-entry_offset)
+        exit_price = grouped[exit_price_field].shift(-exit_offset)
+        prices["label"] = exit_price / entry_price - 1
+        prices["label_start_date"] = grouped["trade_date"].shift(-entry_offset)
+        prices["label_end_date"] = grouped["trade_date"].shift(-exit_offset)
         dataset = merged.merge(
-            prices[["trade_date", "instrument_id", "label", "label_end_date"]],
+            prices[[
+                "trade_date", "instrument_id", "label",
+                "label_start_date", "label_end_date",
+            ]],
             on=["trade_date", "instrument_id"], how="inner",
         ).dropna()
         dataset = dataset[dataset["label_end_date"] <= cutoff].copy()
@@ -112,13 +136,16 @@ class DatasetBuilder:
             "dataset": snapshot.metadata.fingerprint,
             "features": feature_columns,
             "start": start, "end": end, "horizon": horizon,
+            "entry_offset": entry_offset,
+            "entry_price_field": entry_price_field,
+            "exit_price_field": exit_price_field,
             "rows": dataset[["trade_date", "instrument_id", "label"]].to_dict("records"),
         })
         return TrainingDataset(
             dataset[list(feature_columns)].reset_index(drop=True),
             dataset["label"].reset_index(drop=True),
             dataset[["trade_date", "instrument_id"]].reset_index(drop=True),
-            dataset["trade_date"].reset_index(drop=True),
+            dataset["label_start_date"].reset_index(drop=True),
             dataset["label_end_date"].reset_index(drop=True),
             feature_columns,
             fingerprint,

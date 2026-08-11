@@ -18,6 +18,38 @@ from tests.support import canonical_tables, signal_frame
 
 
 class MlWorkflowTests(unittest.TestCase):
+    def test_dataset_supports_next_open_to_following_close_label(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tables, days = canonical_tables()
+            snapshot = SnapshotPublisher(temporary).publish("sample-v1", tables)
+            factors = FactorEngine(Path(temporary) / "cache")
+            returns = factors.compute(
+                ReturnFactor(1), snapshot, days[1], days[-1]
+            ).frame
+            dataset = DatasetBuilder().build(
+                snapshot, {"return_1d": returns}, days[1], days[-1],
+                horizon=1, entry_offset=1,
+                entry_price_field="open_post",
+                exit_price_field="close_post",
+            )
+            first = dataset.index.iloc[0]
+            code = first["instrument_id"]
+            signal_day = first["trade_date"]
+            signal_index = days.index(signal_day)
+            entry_day = days[signal_index + 1]
+            exit_day = days[signal_index + 2]
+            prices = snapshot.post_adjusted_bars(
+                entry_day, exit_day, [code],
+                ["open_post", "close_post"], cutoff=days[-1],
+            ).set_index("trade_date")
+            expected = (
+                prices.loc[exit_day, "close_post"]
+                / prices.loc[entry_day, "open_post"] - 1
+            )
+            self.assertEqual(dataset.label_start_dates.iloc[0], entry_day)
+            self.assertEqual(dataset.label_end_dates.iloc[0], exit_day)
+            self.assertAlmostEqual(dataset.labels.iloc[0], expected)
+
     def test_dataset_purging_and_atomic_workflow_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
             tables, days = canonical_tables()

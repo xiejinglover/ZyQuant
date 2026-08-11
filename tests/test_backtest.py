@@ -7,13 +7,140 @@ from zyquant.backtest import BacktestEngine, StrategyBinding
 from zyquant.config import ExecutionConfig
 from zyquant.data import SnapshotPublisher
 from zyquant.portfolio import ConstraintEngine, PortfolioConstraints, TopKEqualWeightConstructor
-from zyquant.strategy import DailySchedule, ExternalSignalGenerator, PipelineStrategy, StandardUniverseSelector
+from zyquant.strategy import (
+    DailySchedule, ExplicitDateSchedule, ExternalSignalGenerator,
+    PipelineStrategy, ScheduledTargetPortfolio, StandardUniverseSelector,
+)
 from zyquant.strategy.types import StrategyDecision, TargetPortfolio
 
 from tests.support import CODE_A, CODE_B, canonical_tables, signal_frame
 
 
 class BacktestTests(unittest.TestCase):
+    def test_scheduled_cohort_is_skipped_when_exit_is_outside_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tables, days = canonical_tables()
+            snapshot = SnapshotPublisher(temporary).publish("boundary-v1", tables)
+
+            class Strategy:
+                strategy_id = "boundary"
+                schedule = ExplicitDateSchedule((days[3],))
+
+                def decide(self, context):
+                    common = dict(
+                        strategy_id=self.strategy_id,
+                        signal_date=context.signal_date,
+                        cohort_id="last-cohort",
+                        universe_fingerprint="u",
+                        state_before_hash="before",
+                        state_after_hash="after",
+                    )
+                    return StrategyDecision(
+                        None, context.state, None,
+                        scheduled_targets=(
+                            ScheduledTargetPortfolio(
+                                session_offset=1, execution_phase="open",
+                                weights={CODE_B: 0.5}, cash_weight=0.5,
+                                signal_fingerprint="entry", **common,
+                            ),
+                            ScheduledTargetPortfolio(
+                                session_offset=2, execution_phase="close",
+                                weights={}, cash_weight=1.0,
+                                signal_fingerprint="exit", **common,
+                            ),
+                        ),
+                    )
+
+            result = BacktestEngine(ExecutionConfig()).run(
+                snapshot, days[0], days[4],
+                [StrategyBinding(Strategy(), 1.0)], 1_000_000,
+            )
+            self.assertTrue(result.frames["fills"].empty)
+            residuals = result.frames["scheduled_target_residuals"]
+            self.assertEqual(len(residuals), 1)
+            self.assertEqual(residuals.iloc[0]["reason"], "outside_backtest_range")
+
+    def test_scheduled_cohorts_enter_next_open_and_exit_following_close(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tables, days = canonical_tables()
+            snapshot = SnapshotPublisher(temporary).publish("cohort-v1", tables)
+
+            class Strategy:
+                strategy_id = "overnight"
+                schedule = ExplicitDateSchedule((days[0], days[1]))
+
+                def decide(self, context):
+                    cohort = context.signal_date.isoformat()
+                    common = dict(
+                        strategy_id=self.strategy_id,
+                        signal_date=context.signal_date,
+                        cohort_id=cohort,
+                        universe_fingerprint="u",
+                        state_before_hash="before",
+                        state_after_hash="after",
+                    )
+                    entry = ScheduledTargetPortfolio(
+                        session_offset=1, execution_phase="open",
+                        weights={CODE_B: 0.4}, cash_weight=0.6,
+                        signal_fingerprint="entry", **common,
+                    )
+                    exit_ = ScheduledTargetPortfolio(
+                        session_offset=2, execution_phase="close",
+                        weights={}, cash_weight=1.0,
+                        signal_fingerprint="exit", **common,
+                    )
+                    return StrategyDecision(
+                        None, context.state, None,
+                        scheduled_targets=(entry, exit_),
+                    )
+
+            result = BacktestEngine(ExecutionConfig(
+                timing="next_open", max_participation=1.0,
+                commission_bps=0, minimum_commission=0,
+                stock_sell_tax_bps=0, slippage_bps=0,
+                impact_coefficient_bps=0,
+            )).run(
+                snapshot, days[0], days[4],
+                [StrategyBinding(Strategy(), 1.0)], 1_000_000,
+            )
+            fills = result.frames["fills"]
+            executed = fills[fills["filled_quantity"] > 0]
+            first_entry = executed[
+                (executed["execution_date"] == days[1])
+                & (executed["side"] == "buy")
+            ].iloc[0]
+            second_entry = executed[
+                (executed["execution_date"] == days[2])
+                & (executed["execution_phase"] == "open")
+                & (executed["side"] == "buy")
+            ].iloc[0]
+            first_exit = executed[
+                (executed["execution_date"] == days[2])
+                & (executed["execution_phase"] == "close")
+                & (executed["side"] == "sell")
+            ].iloc[0]
+            self.assertEqual(first_entry["execution_phase"], "open")
+            self.assertEqual(first_entry["filled_quantity"], first_exit["filled_quantity"])
+            self.assertGreater(second_entry["filled_quantity"], 0)
+
+            allocations = result.frames["fill_allocations"]
+            first_cohort = days[0].isoformat()
+            close_allocations = allocations[
+                (allocations["execution_date"] == days[2])
+                & (allocations["side"] == "sell")
+            ]
+            self.assertEqual(set(close_allocations["cohort_id"]), {first_cohort})
+            positions = result.frames["positions"]
+            end_of_day = positions[
+                (positions["date"] == days[2])
+                & (positions["instrument_id"] == CODE_B)
+            ]
+            self.assertFalse(end_of_day.empty)
+            self.assertEqual(
+                int(end_of_day.iloc[0]["quantity"]),
+                int(second_entry["filled_quantity"]),
+            )
+
     def test_liquidate_only_target_does_not_rebalance_other_positions(self):
         with tempfile.TemporaryDirectory() as temporary:
             tables, days = canonical_tables()

@@ -21,7 +21,8 @@ from zyquant.portfolio.sleeve import (
 )
 from zyquant.portfolio.capital import CapitalAllocator
 from zyquant.strategy.types import (
-    PortfolioView, PositionView, StrategyContext, StrategyState, TargetPortfolio,
+    PortfolioView, PositionView, ScheduledTargetPortfolio, StrategyContext,
+    StrategyState, TargetPortfolio,
 )
 
 from .market import (
@@ -244,6 +245,7 @@ class BacktestEngine:
             [bootstrap_day, *calendar] if bootstrap_day is not None else calendar
         )
         self._calendar_index = {day: index for index, day in enumerate(calendar)}
+        self._calendar = calendar
         self._rule_cache: dict[tuple[Any, ...], Any] = {}
         instruments = snapshot.table("instruments")
         instrument_rows = {str(row.instrument_id): row for row in instruments.itertuples(index=False)}
@@ -376,10 +378,12 @@ class BacktestEngine:
         for required in (
             "targets", "signals", "strategy_states", "orders", "fills",
             "fill_allocations", "internal_crosses", "nav", "positions",
+            "position_lots",
             "corporate_actions", "sleeve_demands", "demand_residuals",
             "cashflows", "master_nav", "master_positions", "reconciliations",
             "master_corporate_actions",
             "target_events", "candidate_targets", "universe_exclusions",
+            "scheduled_target_residuals",
         ):
             materialized.setdefault(required, pd.DataFrame())
         materialized = enforce_ledger_schemas(materialized)
@@ -470,44 +474,29 @@ class BacktestEngine:
             states[strategy_id] = decision.next_state
             if decision.target is not None:
                 previous_targets[strategy_id] = decision.target
-                pending[(decision.target.execution_date, decision.target.execution_phase)].append(decision.target)
-                # Serialised once: the same diagnostics object is written to the
-                # target_events row and to every per-instrument targets row, and
-                # it carries the whole constraint report.
-                diagnostics_json = canonical_json(decision.target.diagnostics)
-                frames["target_events"].append({
-                    "strategy_id": strategy_id, "signal_date": signal_day,
-                    "execution_date": decision.target.execution_date,
-                    "execution_phase": decision.target.execution_phase,
-                    "cash_weight": decision.target.cash_weight,
-                    "universe_fingerprint": decision.target.universe_fingerprint,
-                    "signal_fingerprint": decision.target.signal_fingerprint,
-                    "state_before_hash": decision.target.state_before_hash,
-                    "state_after_hash": decision.target.state_after_hash,
-                    "diagnostics": diagnostics_json,
-                })
-                report = decision.target.diagnostics.get("constraint_report")
-                if report is not None:
-                    for code, weight in report.before.items():
-                        frames["candidate_targets"].append({
-                            "strategy_id": strategy_id,
-                            "signal_date": signal_day,
-                            "execution_date": decision.target.execution_date,
-                            "instrument_id": code, "weight": weight,
-                        })
-                for code, weight in decision.target.weights.items():
-                    frames["targets"].append({
-                        "strategy_id": strategy_id, "signal_date": signal_day,
-                        "execution_date": decision.target.execution_date,
-                        "instrument_id": code, "weight": weight,
-                        "cash_weight": decision.target.cash_weight,
-                        "execution_phase": decision.target.execution_phase,
-                        "universe_fingerprint": decision.target.universe_fingerprint,
-                        "signal_fingerprint": decision.target.signal_fingerprint,
-                        "state_before_hash": decision.target.state_before_hash,
-                        "state_after_hash": decision.target.state_after_hash,
-                        "diagnostics": diagnostics_json,
+                self._enqueue_target(decision.target, pending, frames)
+            by_cohort: dict[str, list[ScheduledTargetPortfolio]] = defaultdict(list)
+            for item in decision.scheduled_targets:
+                by_cohort[item.cohort_id].append(item)
+            for cohort_id, scheduled in by_cohort.items():
+                indexes = [day_index + item.session_offset for item in scheduled]
+                if any(index < 0 or index >= len(self._calendar) for index in indexes):
+                    frames["scheduled_target_residuals"].append({
+                        "strategy_id": strategy_id,
+                        "signal_date": signal_day,
+                        "cohort_id": cohort_id,
+                        "reason": "outside_backtest_range",
                     })
+                    continue
+                for item, index in zip(scheduled, indexes, strict=True):
+                    target = TargetPortfolio(
+                        item.strategy_id, item.signal_date, self._calendar[index],
+                        item.execution_phase, item.weights, item.cash_weight,
+                        item.universe_fingerprint, item.signal_fingerprint,
+                        item.state_before_hash, item.state_after_hash,
+                        item.diagnostics, item.cohort_id,
+                    )
+                    self._enqueue_target(target, pending, frames)
             frames["strategy_states"].append({
                 "strategy_id": strategy_id, "date": signal_day,
                 "state_hash": hash_payload(decision.next_state),
@@ -522,6 +511,40 @@ class BacktestEngine:
                     **exclusion,
                 })
 
+    @staticmethod
+    def _enqueue_target(target, pending, frames):
+        pending[(target.execution_date, target.execution_phase)].append(target)
+        diagnostics_json = canonical_json(target.diagnostics)
+        common = {
+            "strategy_id": target.strategy_id,
+            "signal_date": target.signal_date,
+            "execution_date": target.execution_date,
+            "execution_phase": target.execution_phase,
+            "cash_weight": target.cash_weight,
+            "universe_fingerprint": target.universe_fingerprint,
+            "signal_fingerprint": target.signal_fingerprint,
+            "state_before_hash": target.state_before_hash,
+            "state_after_hash": target.state_after_hash,
+            "cohort_id": target.cohort_id,
+            "diagnostics": diagnostics_json,
+        }
+        frames["target_events"].append(common)
+        report = target.diagnostics.get("constraint_report")
+        if report is not None:
+            for code, weight in report.before.items():
+                frames["candidate_targets"].append({
+                    "strategy_id": target.strategy_id,
+                    "signal_date": target.signal_date,
+                    "execution_date": target.execution_date,
+                    "instrument_id": code,
+                    "weight": weight,
+                    "cohort_id": target.cohort_id,
+                })
+        for code, weight in target.weights.items():
+            frames["targets"].append({
+                **common, "instrument_id": code, "weight": weight,
+            })
+
     def _execute_targets(
         self, day, phase, targets, sleeves, market, instrument_rows, calendar,
         frames, master, snapshot,
@@ -532,8 +555,8 @@ class BacktestEngine:
         for target in targets:
             sleeve = sleeves[target.strategy_id]
             missing_held = [
-                code for code in sleeve.lots
-                if sleeve.quantity(code) > 0 and code not in prices
+                code for code in sleeve.instruments(target.cohort_id)
+                if code not in prices
             ]
             if missing_held:
                 raise BacktestError(
@@ -555,7 +578,7 @@ class BacktestEngine:
             codes = (
                 set(map(str, liquidation))
                 if liquidation is not None
-                else set(target.weights) | set(sleeve.lots)
+                else set(target.weights) | sleeve.instruments(target.cohort_id)
             )
             for code in sorted(codes):
                 price = prices.get(code)
@@ -567,10 +590,11 @@ class BacktestEngine:
                         nav * target.weights.get(code, 0.0) / price / lot
                     ) * lot
                 )
-                difference = desired - sleeve.quantity(code)
+                difference = desired - sleeve.quantity(code, target.cohort_id)
                 if difference < 0:
                     sellable = min(
-                        -difference, sleeve.sellable_quantity(code, day)
+                        -difference,
+                        sleeve.sellable_quantity(code, day, target.cohort_id),
                     )
                     executable = (
                         sellable if liquidation is not None
@@ -588,11 +612,14 @@ class BacktestEngine:
             codes = (
                 set(map(str, liquidation))
                 if liquidation is not None
-                else set(target.weights) | set(sleeve.lots)
+                else set(target.weights) | sleeve.instruments(target.cohort_id)
             )
             for code in sorted(codes):
                 price = prices.get(code)
-                demand_id = f"{day}:{phase}:{target.strategy_id}:{code}"
+                cohort_suffix = f":{target.cohort_id}" if target.cohort_id else ""
+                demand_id = (
+                    f"{day}:{phase}:{target.strategy_id}:{code}{cohort_suffix}"
+                )
                 if code not in instrument_rows:
                     raise BacktestError(f"target references unknown instrument: {code}")
                 if price is None or price <= 0:
@@ -610,11 +637,14 @@ class BacktestEngine:
                         nav * target.weights.get(code, 0.0) / price / lot
                     ) * lot
                 )
-                current = sleeve.quantity(code)
+                current = sleeve.quantity(code, target.cohort_id)
                 difference = desired - current
                 if difference < 0:
                     requested = -difference
-                    quantity = min(requested, sleeve.sellable_quantity(code, day))
+                    quantity = min(
+                        requested,
+                        sleeve.sellable_quantity(code, day, target.cohort_id),
+                    )
                     if liquidation is None:
                         quantity = math.floor(quantity / lot) * lot
                     if quantity < requested:
@@ -630,7 +660,7 @@ class BacktestEngine:
                         demand = SleeveDemand(
                             target.strategy_id, code, "sell", quantity, price,
                             demand_lot,
-                            demand_id, phase, desired,
+                            demand_id, phase, desired, target.cohort_id,
                         )
                         demands.append(demand)
                         frames["sleeve_demands"].append(asdict(demand))
@@ -652,7 +682,7 @@ class BacktestEngine:
                     if quantity:
                         demand = SleeveDemand(
                             target.strategy_id, code, "buy", quantity, price, lot,
-                            demand_id, phase, desired,
+                            demand_id, phase, desired, target.cohort_id,
                         )
                         demands.append(demand)
                         frames["sleeve_demands"].append(asdict(demand))
@@ -729,18 +759,26 @@ class BacktestEngine:
         if not crosses:
             return
         cash_delta = {strategy_id: 0.0 for strategy_id in sleeves}
-        required: dict[tuple[str, str], int] = defaultdict(int)
+        required: dict[tuple[str, str, str | None], int] = defaultdict(int)
         for cross in crosses:
             notional = cross.quantity * cross.price
             cash_delta[cross.seller_strategy_id] += notional
             cash_delta[cross.buyer_strategy_id] -= notional
-            required[(cross.seller_strategy_id, cross.instrument_id)] += cross.quantity
-        for (strategy_id, code), quantity in required.items():
-            if sleeves[strategy_id].sellable_quantity(code, day) < quantity:
+            required[
+                (cross.seller_strategy_id, cross.instrument_id,
+                 cross.seller_cohort_id)
+            ] += cross.quantity
+        for (strategy_id, code, cohort_id), quantity in required.items():
+            if sleeves[strategy_id].sellable_quantity(
+                code, day, cohort_id,
+            ) < quantity:
                 raise BacktestError("internal crosses exceed a sleeve's sellable position")
         for cross in crosses:
             seller = sleeves[cross.seller_strategy_id]
-            removed = seller.remove(cross.instrument_id, cross.quantity, day)
+            removed = seller.remove(
+                cross.instrument_id, cross.quantity, day,
+                cross.seller_cohort_id,
+            )
             if removed != cross.quantity:
                 raise BacktestError("internal cross allocation changed after validation")
         for strategy_id, delta in cash_delta.items():
@@ -751,7 +789,8 @@ class BacktestEngine:
                 day, int(instrument_rows[cross.instrument_id].sell_delay_days), calendar
             )
             buyer.add_lot(PositionLot(
-                cross.instrument_id, cross.quantity, day, sellable_date, cross.price
+                cross.instrument_id, cross.quantity, day, sellable_date,
+                cross.price, cross.buyer_cohort_id,
             ))
             frames["internal_crosses"].append(asdict(cross))
             frames["cashflows"].extend([
@@ -800,6 +839,13 @@ class BacktestEngine:
         fill = self.executor.execute(order, row, asset_type, rule)
         self._validate_fill(order, fill)
         demands = residuals.get((order.instrument_id, order.side), [])
+        demand_by_strategy = {}
+        for demand in demands:
+            if demand.strategy_id in demand_by_strategy:
+                raise BacktestError(
+                    "multiple same-phase cohort demands for one strategy and instrument"
+                )
+            demand_by_strategy[demand.strategy_id] = demand
         quantities = allocate_fill_quantities(order, fill.filled_quantity, demands)
         if order.side == "buy":
             # Resolved once per order: the rule and asset type are loop
@@ -843,12 +889,19 @@ class BacktestEngine:
         allocations = cost_allocations(
             order, quantities, fill.price, commission, tax,
             fill.slippage_bps + fill.impact_bps,
+            {
+                strategy_id: demand_by_strategy[strategy_id].cohort_id
+                for strategy_id in quantities
+            },
         )
         for allocation in allocations:
             sleeve = sleeves[allocation.strategy_id]
             notional = allocation.quantity * allocation.price
             if allocation.side == "sell":
-                removed = sleeve.remove(allocation.instrument_id, allocation.quantity, order.execution_date)
+                removed = sleeve.remove(
+                    allocation.instrument_id, allocation.quantity,
+                    order.execution_date, allocation.cohort_id,
+                )
                 if removed != allocation.quantity:
                     raise BacktestError("allocated sell exceeds sellable sleeve quantity")
                 sleeve.cash += notional - allocation.commission - allocation.tax
@@ -862,7 +915,7 @@ class BacktestEngine:
                 )
                 sleeve.add_lot(PositionLot(
                     allocation.instrument_id, allocation.quantity, order.execution_date,
-                    sellable_date, allocation.price,
+                    sellable_date, allocation.price, allocation.cohort_id,
                 ))
             frames["fill_allocations"].append(asdict(allocation))
             signed_notional = notional if allocation.side == "sell" else -notional
@@ -1000,16 +1053,44 @@ class BacktestEngine:
                 f"{context.strategy_id}: strategy state is not serializable"
             ) from exc
         target = decision.target
-        if target is None:
-            return
-        if target.strategy_id != context.strategy_id:
-            raise BacktestError("target strategy_id does not match its binding")
-        if target.signal_date != context.signal_date:
-            raise BacktestError("target signal_date does not match the decision context")
-        if target.execution_date != context.execution_date:
-            raise BacktestError("target execution_date does not match the decision context")
-        if target.execution_phase != context.execution_phase:
-            raise BacktestError("target execution_phase does not match the decision context")
+        if target is not None:
+            if target.strategy_id != context.strategy_id:
+                raise BacktestError("target strategy_id does not match its binding")
+            if target.signal_date != context.signal_date:
+                raise BacktestError("target signal_date does not match the decision context")
+            if target.execution_date != context.execution_date:
+                raise BacktestError("target execution_date does not match the decision context")
+            if target.execution_phase != context.execution_phase:
+                raise BacktestError("target execution_phase does not match the decision context")
+            self._validate_target_weights(target)
+        seen: set[tuple[str, int, str]] = set()
+        for scheduled in decision.scheduled_targets:
+            if not isinstance(scheduled, ScheduledTargetPortfolio):
+                raise BacktestError("scheduled target has an invalid type")
+            if scheduled.strategy_id != context.strategy_id:
+                raise BacktestError(
+                    "scheduled target strategy_id does not match its binding"
+                )
+            if scheduled.signal_date != context.signal_date:
+                raise BacktestError(
+                    "scheduled target signal_date does not match the decision context"
+                )
+            if scheduled.session_offset < 1:
+                raise BacktestError("scheduled target session_offset must be positive")
+            if scheduled.execution_phase not in {"open", "close"}:
+                raise BacktestError("scheduled target phase must be open or close")
+            if not scheduled.cohort_id:
+                raise BacktestError("scheduled target cohort_id must not be empty")
+            identity = (
+                scheduled.cohort_id, scheduled.session_offset,
+                scheduled.execution_phase,
+            )
+            if identity in seen:
+                raise BacktestError("duplicate scheduled target for cohort and phase")
+            seen.add(identity)
+            self._validate_target_weights(scheduled)
+
+    def _validate_target_weights(self, target):
         weights = {str(code): float(value) for code, value in target.weights.items()}
         values = [*weights.values(), float(target.cash_weight)]
         if not all(math.isfinite(value) for value in values):
@@ -1095,9 +1176,7 @@ class BacktestEngine:
                             )
                         else:
                             delta = int(round(quantity * (multiplier - 1.0)))
-                        if delta > 0:
-                            sleeve.add_lot(PositionLot(code, delta, day, day, 0.0))
-                        elif delta < 0 and sleeve.remove_any(code, -delta) != -delta:
+                        if sleeve.adjust_shares(code, delta, day) != delta:
                             raise BacktestError("company action exceeds entitled sleeve position")
                         destination = (
                             "master_corporate_actions"
@@ -1147,6 +1226,17 @@ class BacktestEngine:
                         "instrument_id": code, "quantity": quantity,
                         "last_price": price, "market_value": quantity * price,
                     })
+                for lot in sleeve.lots[code]:
+                    if lot.quantity:
+                        frames["position_lots"].append({
+                            "date": day, "strategy_id": strategy_id,
+                            "instrument_id": code,
+                            "cohort_id": lot.cohort_id,
+                            "quantity": lot.quantity,
+                            "acquisition_date": lot.acquisition_date,
+                            "sellable_date": lot.sellable_date,
+                            "unit_cost": lot.unit_cost,
+                        })
         master.reconcile(sleeves, prices)
         frames["master_nav"].append({
             "date": day, "account_id": "__master__", "cash": master.cash,
