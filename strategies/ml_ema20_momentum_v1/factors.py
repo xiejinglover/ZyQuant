@@ -363,8 +363,18 @@ def _one_instrument(group: pd.DataFrame) -> pd.DataFrame:
     output["upper_shadow_ratio"] = upper_shadow
     output["lower_shadow_ratio"] = lower_shadow
     output["body_ratio"] = body
-    output["intraday_return"] = close / opened - 1.0
-    output["overnight_gap"] = opened / previous_close - 1.0
+    intraday = np.full(len(group), np.nan)
+    overnight = np.full(len(group), np.nan)
+    np.divide(
+        close, opened, out=intraday,
+        where=np.isfinite(opened) & (opened != 0),
+    )
+    np.divide(
+        opened, previous_close, out=overnight,
+        where=np.isfinite(previous_close) & (previous_close != 0),
+    )
+    output["intraday_return"] = intraday - 1.0
+    output["overnight_gap"] = overnight - 1.0
     output[list(FEATURE_NAMES)] = output[list(FEATURE_NAMES)].replace(
         [np.inf, -np.inf], np.nan
     )
