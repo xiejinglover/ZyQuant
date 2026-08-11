@@ -179,7 +179,14 @@ def predict(model: Any, frame: pd.DataFrame) -> np.ndarray:
     ordered = frame.sort_values(
         ["signal_date", "instrument_id"], kind="mergesort", ignore_index=True
     )
-    score = np.asarray(model.predict(ordered[list(MODEL_FEATURES)]), dtype=float)
+    try:
+        from xgboost import DMatrix
+    except ImportError as exc:
+        raise StrategyError(
+            "XGBoost prediction requires the 'ml-ranking' optional dependency"
+        ) from exc
+    matrix = DMatrix(ordered[list(MODEL_FEATURES)], feature_names=list(MODEL_FEATURES))
+    score = np.asarray(model.get_booster().predict(matrix), dtype=float)
     if score.shape != (len(ordered),) or not np.isfinite(score).all():
         raise StrategyError("XGBoost produced invalid prediction scores")
     return score
