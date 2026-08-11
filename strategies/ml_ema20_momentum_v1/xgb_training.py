@@ -5,7 +5,7 @@ from datetime import date
 import hashlib
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -56,14 +56,18 @@ class PreparedFold:
     embargo_dates: tuple[date, date]
 
 
-def preprocess_daily(frame: pd.DataFrame) -> pd.DataFrame:
+def preprocess_daily(
+    frame: pd.DataFrame,
+    features: Sequence[str] = MODEL_FEATURES,
+) -> pd.DataFrame:
     """PIT daily winsorisation and percentile ranks inside the event pool."""
     result = frame.copy()
-    numeric = result[list(MODEL_FEATURES)].apply(pd.to_numeric, errors="coerce")
+    selected = tuple(features)
+    numeric = result[list(selected)].apply(pd.to_numeric, errors="coerce")
     values = numeric.to_numpy(dtype=float)
     if not np.isfinite(values).all():
         raise StrategyError("XGBoost input features must all be finite")
-    for column in CONTINUOUS_FEATURES:
+    for column in (feature for feature in selected if feature in CONTINUOUS_FEATURES):
         grouped = numeric.groupby(result["signal_date"], sort=False)[column]
         lower = grouped.transform(lambda values_: values_.quantile(0.01))
         upper = grouped.transform(lambda values_: values_.quantile(0.99))
@@ -71,11 +75,11 @@ def preprocess_daily(frame: pd.DataFrame) -> pd.DataFrame:
         result[column] = clipped.groupby(result["signal_date"], sort=False).rank(
             method="average", pct=True
         )
-    for column in BINARY_FEATURES:
+    for column in (feature for feature in selected if feature in BINARY_FEATURES):
         result[column] = numeric[column].astype(float)
         if not result[column].isin([0.0, 1.0]).all():
             raise StrategyError(f"binary feature contains values outside 0/1: {column}")
-    transformed = result[list(MODEL_FEATURES)].to_numpy(dtype=float)
+    transformed = result[list(selected)].to_numpy(dtype=float)
     if not np.isfinite(transformed).all():
         raise StrategyError("preprocessing produced a non-finite feature")
     return result
@@ -125,17 +129,26 @@ def prepare_fold(
     return PreparedFold(train, fit, validation, test, validation_start, embargo)
 
 
-def _matrix(frame: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+def _matrix(
+    frame: pd.DataFrame,
+    features: Sequence[str] = MODEL_FEATURES,
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     ordered = frame.sort_values(
         ["signal_date", "instrument_id"], kind="mergesort", ignore_index=True
     )
-    x = ordered[list(MODEL_FEATURES)].astype(float)
+    x = ordered[list(features)].astype(float)
     y = make_relevance(ordered).to_numpy(dtype=int)
     qid, _ = pd.factorize(ordered["signal_date"], sort=False)
     return x, y, qid.astype(np.uint32)
 
 
-def _ranker(device: str, *, iterations: int, early_stopping: bool) -> Any:
+def _ranker(
+    device: str,
+    *,
+    iterations: int,
+    early_stopping: bool,
+    n_jobs: int | None = None,
+) -> Any:
     try:
         from xgboost import XGBRanker
     except ImportError as exc:
@@ -149,13 +162,24 @@ def _ranker(device: str, *, iterations: int, early_stopping: bool) -> Any:
     }
     if early_stopping:
         parameters["early_stopping_rounds"] = 100
+    if n_jobs is not None:
+        parameters["n_jobs"] = int(n_jobs)
     return XGBRanker(**parameters)
 
 
-def fit_early_stopping(fold: PreparedFold, device: str) -> tuple[Any, int, float]:
-    x_fit, y_fit, qid_fit = _matrix(fold.fit)
-    x_valid, y_valid, qid_valid = _matrix(fold.validation)
-    model = _ranker(device, iterations=2000, early_stopping=True)
+def fit_early_stopping(
+    fold: PreparedFold,
+    device: str,
+    features: Sequence[str] = MODEL_FEATURES,
+    *,
+    max_estimators: int = 2000,
+    n_jobs: int | None = None,
+) -> tuple[Any, int, float]:
+    x_fit, y_fit, qid_fit = _matrix(fold.fit, features)
+    x_valid, y_valid, qid_valid = _matrix(fold.validation, features)
+    model = _ranker(
+        device, iterations=max_estimators, early_stopping=True, n_jobs=n_jobs,
+    )
     model.fit(
         x_fit, y_fit, qid=qid_fit,
         eval_set=[(x_valid, y_valid)], eval_qid=[qid_valid],
@@ -168,14 +192,27 @@ def fit_early_stopping(fold: PreparedFold, device: str) -> tuple[Any, int, float
     return model, best_iteration, best_score
 
 
-def refit_full(fold: PreparedFold, device: str, iterations: int) -> Any:
-    x_train, y_train, qid_train = _matrix(fold.train)
-    model = _ranker(device, iterations=iterations, early_stopping=False)
+def refit_full(
+    fold: PreparedFold,
+    device: str,
+    iterations: int,
+    features: Sequence[str] = MODEL_FEATURES,
+    *,
+    n_jobs: int | None = None,
+) -> Any:
+    x_train, y_train, qid_train = _matrix(fold.train, features)
+    model = _ranker(
+        device, iterations=iterations, early_stopping=False, n_jobs=n_jobs,
+    )
     model.fit(x_train, y_train, qid=qid_train, verbose=False)
     return model
 
 
-def predict(model: Any, frame: pd.DataFrame) -> np.ndarray:
+def predict(
+    model: Any,
+    frame: pd.DataFrame,
+    features: Sequence[str] = MODEL_FEATURES,
+) -> np.ndarray:
     ordered = frame.sort_values(
         ["signal_date", "instrument_id"], kind="mergesort", ignore_index=True
     )
@@ -185,21 +222,29 @@ def predict(model: Any, frame: pd.DataFrame) -> np.ndarray:
         raise StrategyError(
             "XGBoost prediction requires the 'ml-ranking' optional dependency"
         ) from exc
-    matrix = DMatrix(ordered[list(MODEL_FEATURES)], feature_names=list(MODEL_FEATURES))
+    matrix = DMatrix(ordered[list(features)], feature_names=list(features))
     score = np.asarray(model.get_booster().predict(matrix), dtype=float)
     if score.shape != (len(ordered),) or not np.isfinite(score).all():
         raise StrategyError("XGBoost produced invalid prediction scores")
     return score
 
 
-def determinism_check(fold: PreparedFold, device: str) -> dict[str, Any]:
-    first, first_iterations, first_metric = fit_early_stopping(fold, device)
-    second, second_iterations, second_metric = fit_early_stopping(fold, device)
+def determinism_check(
+    fold: PreparedFold,
+    device: str,
+    features: Sequence[str] = MODEL_FEATURES,
+) -> dict[str, Any]:
+    first, first_iterations, first_metric = fit_early_stopping(
+        fold, device, features,
+    )
+    second, second_iterations, second_metric = fit_early_stopping(
+        fold, device, features,
+    )
     sample = fold.validation.sort_values(
         ["signal_date", "instrument_id"], kind="mergesort", ignore_index=True
     )
-    first_score = predict(first, sample)
-    second_score = predict(second, sample)
+    first_score = predict(first, sample, features)
+    second_score = predict(second, sample, features)
     maximum_error = float(np.max(np.abs(first_score - second_score)))
     return {
         "stable": maximum_error <= 1e-12 and first_iterations == second_iterations,

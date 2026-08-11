@@ -81,3 +81,29 @@ cd /data/zzh/ZyQuant
 训练入口使用每日 EMA20 事件池内去极值与 percentile rank，以0–4档
 relevance 训练 `XGBRanker(rank:ndcg)`。正式预测生成后，使用
 `server_backtest_xgb_2015_2026.yaml` 运行2015–2026滚动回测。
+
+## 10,000组随机因子组合搜索
+
+搜索从53个模型特征中无放回随机选择5–30个，固定种子生成10,000个唯一
+组合。组合选择只使用2015–2022年度样本外结果，2023–2026保持为最终
+保留区间。每个组合仍按3年训练、1年预测训练真实XGBRanker；搜索阶段最多
+500轮并使用early stopping，入选组合再恢复正式2000轮上限复验。
+
+```bash
+SEARCH=/data/zzh/ZyQuant/runs/ml_ema20_momentum_v1/feature_search/xgb_feature_subset_10k_v1
+
+/data/zzh/envs/zyquant-2.0/bin/python -P \
+  strategies/ml_ema20_momentum_v1/feature_search.py prepare --root "$SEARCH"
+
+/data/zzh/envs/zyquant-2.0/bin/python -P \
+  strategies/ml_ema20_momentum_v1/feature_search.py benchmark --root "$SEARCH" \
+  --benchmark-workers 1,2,4,8 --benchmark-trials 8
+
+/data/zzh/envs/zyquant-2.0/bin/python -P \
+  strategies/ml_ema20_momentum_v1/feature_search.py run --root "$SEARCH" \
+  --workers 4 --device cuda --feature-threads 4
+```
+
+控制器将试验状态写入统一实验数据库，支持同一命令断点续跑；创建 `STOP`
+文件或执行 `feature_search.py stop` 会在当前任务完成后安全停止。搜索结束后
+发布 `trials.parquet`、`top100.csv`、因子入选频率、组合规模统计和研究报告。
