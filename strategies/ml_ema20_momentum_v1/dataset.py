@@ -40,6 +40,37 @@ class RollingYearFold:
     test: pd.DataFrame
 
 
+def clean_training_panel(
+    panel: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Remove unusable labels and every row with a non-finite model feature."""
+    feature_values = panel[list(MODEL_FEATURES)].apply(
+        pd.to_numeric, errors="coerce"
+    ).to_numpy(dtype=float)
+    finite_features = np.isfinite(feature_values).all(axis=1)
+    valid_label = panel["label_valid"].fillna(False).astype(bool).to_numpy()
+    included = valid_label & finite_features
+    excluded = panel.loc[
+        ~included, ["signal_date", "instrument_id", "label_status"]
+    ].copy()
+    excluded["invalid_label"] = ~valid_label[~included]
+    excluded["nonfinite_feature"] = ~finite_features[~included]
+    excluded["exclusion_reason"] = np.select(
+        [
+            excluded["invalid_label"] & excluded["nonfinite_feature"],
+            excluded["invalid_label"],
+            excluded["nonfinite_feature"],
+        ],
+        ["invalid_label_and_nonfinite_feature", "invalid_label", "nonfinite_feature"],
+        default="unknown",
+    )
+    cleaned = panel.loc[included].copy()
+    cleaned.drop(columns=["label_valid", "label_status"], inplace=True)
+    cleaned.reset_index(drop=True, inplace=True)
+    excluded.reset_index(drop=True, inplace=True)
+    return cleaned, excluded
+
+
 def candidate_keys(panel: Ema20UniversePanel) -> pd.DataFrame:
     rows = [
         {"signal_date": day, "instrument_id": instrument_id}

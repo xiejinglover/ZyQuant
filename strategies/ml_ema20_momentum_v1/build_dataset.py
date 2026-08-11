@@ -29,6 +29,7 @@ from strategies.ml_ema20_momentum_v1.dataset import (  # noqa: E402
     attach_executable_labels,
     attach_factor,
     candidate_keys,
+    clean_training_panel,
     frame_fingerprint,
     numeric_quality,
     rolling_year_folds,
@@ -116,6 +117,10 @@ def main(argv: list[str] | None = None) -> int:
         ["signal_date", "instrument_id"], kind="mergesort", inplace=True,
         ignore_index=True,
     )
+    source_candidate_rows = len(panel)
+    source_label_status = panel["label_status"].value_counts(dropna=False).to_dict()
+    panel, excluded = clean_training_panel(panel)
+    panel["label_valid"] = True
     folds = rolling_year_folds(
         panel, first_year=start.year, last_year=end.year, training_years=3,
     )
@@ -137,7 +142,10 @@ def main(argv: list[str] | None = None) -> int:
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".dataset.", dir=destination.parent))
     try:
-        panel.to_parquet(staging / "labeled_panel.parquet", index=False)
+        panel.drop(columns=["label_valid"]).to_parquet(
+            staging / "labeled_panel.parquet", index=False
+        )
+        excluded.to_parquet(staging / "excluded_samples.parquet", index=False)
         universe.diagnostics.to_parquet(
             staging / "universe_diagnostics.parquet", index=False
         )
@@ -167,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                 "test_start": fold.test["signal_date"].min(),
                 "test_end": fold.test["signal_date"].max(),
             })
-        valid_panel = panel[panel["label_valid"]]
+        valid_panel = panel
         label_values = valid_panel[LABEL_COLUMN]
         label_by_year = []
         for year, group in valid_panel.groupby(
@@ -184,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             })
         manifest = {
             "strategy": "ml_ema20_momentum_v1",
-            "dataset_version": "rolling_3y_1y_v1",
+            "dataset_version": "rolling_3y_1y_v2_clean",
             "snapshot_id": snapshot.metadata.dataset_id,
             "snapshot_fingerprint": snapshot.metadata.fingerprint,
             "factor_manifest": str(args.factor_manifest.resolve()),
@@ -197,8 +205,10 @@ def main(argv: list[str] | None = None) -> int:
             "cross_sectional_feature_count": len(MODEL_FEATURES) - len(FEATURE_NAMES),
             "label_column": LABEL_COLUMN,
             "label_definition": LABEL_DEFINITION,
+            "source_candidate_rows": source_candidate_rows,
             "candidate_rows": len(panel),
-            "valid_label_rows": int(panel["label_valid"].sum()),
+            "excluded_rows": len(excluded),
+            "valid_label_rows": len(panel),
             "panel_fingerprint": frame_fingerprint(
                 panel, ["signal_date", "instrument_id", *MODEL_FEATURES, LABEL_COLUMN]
             ),
@@ -206,10 +216,14 @@ def main(argv: list[str] | None = None) -> int:
             "seconds": round(time.perf_counter() - began, 3),
         }
         quality_report = {
-            "training_ready": feature_inf == 0 and label_inf == 0,
+            "training_ready": (
+                feature_inf == 0 and label_inf == 0
+                and not panel[list(MODEL_FEATURES)].isna().any(axis=None)
+            ),
             "feature_inf_count": feature_inf,
             "label_inf_count": label_inf,
-            "label_status": panel["label_status"].value_counts(dropna=False).to_dict(),
+            "source_label_status": source_label_status,
+            "excluded_by_reason": excluded["exclusion_reason"].value_counts().to_dict(),
             "complete_feature_rows": int(panel[list(MODEL_FEATURES)].notna().all(axis=1).sum()),
             "any_feature_nan_rows": int(panel[list(MODEL_FEATURES)].isna().any(axis=1).sum()),
             "columns": quality,
@@ -235,8 +249,9 @@ def main(argv: list[str] | None = None) -> int:
         raise
     print(f"published rolling dataset: {destination}")
     print(
-        f"candidates={len(panel):,} valid_labels={int(panel['label_valid'].sum()):,} "
-        f"feature_inf={feature_inf} label_inf={label_inf} folds={len(folds)}"
+        f"source_candidates={source_candidate_rows:,} clean_rows={len(panel):,} "
+        f"excluded={len(excluded):,} feature_inf={feature_inf} "
+        f"label_inf={label_inf} folds={len(folds)}"
     )
     return 0
 

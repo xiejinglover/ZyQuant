@@ -11,6 +11,7 @@ from strategies.ml_ema20_momentum_v1.dataset import (
     MODEL_FEATURES,
     add_cross_sectional_features,
     attach_executable_labels,
+    clean_training_panel,
     numeric_quality,
     rolling_year_folds,
 )
@@ -96,3 +97,26 @@ def test_numeric_quality_counts_nan_and_signed_infinity_separately() -> None:
     assert quality["positive_inf"] == 1
     assert quality["negative_inf"] == 1
     assert quality["finite"] == 1
+
+
+def test_clean_panel_removes_invalid_labels_and_any_nonfinite_feature() -> None:
+    rows = []
+    for index in range(4):
+        row = {
+            "signal_date": date(2020, 1, 2 + index),
+            "instrument_id": f"00000{index}.XSHE",
+            "label_valid": index != 1,
+            "label_status": "valid" if index != 1 else "missing_entry_price",
+            LABEL_COLUMN: 0.01 if index != 1 else np.nan,
+        }
+        row.update({feature: 1.0 for feature in MODEL_FEATURES})
+        rows.append(row)
+    rows[2]["ret_60d"] = np.nan
+    rows[3]["score"] = np.inf
+    clean, excluded = clean_training_panel(pd.DataFrame(rows))
+    assert clean["instrument_id"].tolist() == ["000000.XSHE"]
+    assert len(excluded) == 3
+    assert excluded["exclusion_reason"].value_counts().to_dict() == {
+        "invalid_label": 1, "nonfinite_feature": 2,
+    }
+    assert not clean[list(MODEL_FEATURES)].isna().any(axis=None)

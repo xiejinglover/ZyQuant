@@ -60,9 +60,9 @@ cd /data/zzh/ZyQuant
   --dataset hermes-cn-a-2010-20260724-v4 \
   --cache-root /data/zzh/ZyQuant/.zyquant/cache/factors \
   --factor-manifest /data/zzh/ZyQuant/runs/ml_ema20_momentum_v1/factors/cache_manifest.json \
-  --output /data/zzh/ZyQuant/runs/ml_ema20_momentum_v1/datasets/rolling_3y_1y_v1
+  --output /data/zzh/ZyQuant/runs/ml_ema20_momentum_v1/datasets/rolling_3y_1y_v2_clean
 ```
 
-标签为 `close_post[T+2] / open_post[T+1] - 1`。原始 labeled panel 保留特征
-NaN 供审计；各年 fold 只排除标签不可用的行，特征 NaN 保留给后续
-“仅训练集拟合”的缺失处理。±Inf 不会被静默替换。
+标签为 `close_post[T+2] / open_post[T+1] - 1`。正式 labeled panel 和各年 fold
+同时剔除无效标签以及任一模型特征为 NaN/±Inf 的行。
+`excluded_samples.parquet` 只保留被排除的键和原因，不是可训练面板。
