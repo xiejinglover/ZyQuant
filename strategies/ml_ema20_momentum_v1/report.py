@@ -33,6 +33,7 @@ def _open_cohorts(
     states: pd.DataFrame,
     positions: pd.DataFrame,
     fills: pd.DataFrame,
+    allocations: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     if states.empty:
         return pd.DataFrame()
@@ -45,9 +46,32 @@ def _open_cohorts(
     if not positions.empty and "date" in positions:
         latest_positions = positions[positions["date"] == positions["date"].max()]
     position_map = {
-        str(row.instrument_id): float(getattr(row, "market_value", 0.0))
+        str(row.instrument_id): {
+            "quantity": int(getattr(row, "quantity", 0)),
+            "price": float(getattr(row, "last_price", 0.0)),
+        }
         for row in latest_positions.itertuples(index=False)
     }
+    position_date = (
+        pd.to_datetime(latest_positions["date"].max()).date()
+        if not latest_positions.empty and "date" in latest_positions else None
+    )
+    later_sells: dict[tuple[str, str], int] = {}
+    if allocations is not None and not allocations.empty and position_date is not None:
+        working = allocations.copy()
+        working["execution_date"] = pd.to_datetime(
+            working["execution_date"]
+        ).dt.date
+        working = working[
+            (working["side"] == "sell")
+            & (working["execution_date"] > position_date)
+        ]
+        later_sells = {
+            (str(cohort_id), str(code)): int(group["quantity"].sum())
+            for (cohort_id, code), group in working.groupby(
+                ["cohort_id", "instrument_id"], dropna=False,
+            )
+        }
     failure_map: dict[str, str] = {}
     if not fills.empty:
         failed = fills[
@@ -60,10 +84,16 @@ def _open_cohorts(
     rows = []
     for cohort_id, raw in sorted(cohorts.items()):
         signal_date = pd.Timestamp(raw["signal_date"]).date()
-        symbols = [
-            code for code in map(str, raw.get("symbols", []))
-            if position_map.get(code, 0.0) > 0.0
-        ]
+        values = {}
+        for code in map(str, raw.get("symbols", [])):
+            position = position_map.get(code, {"quantity": 0, "price": 0.0})
+            quantity = max(
+                0, int(position["quantity"])
+                - later_sells.get((str(cohort_id), code), 0),
+            )
+            if quantity:
+                values[code] = quantity * float(position["price"])
+        symbols = sorted(values)
         if not symbols:
             continue
         rows.append({
@@ -72,7 +102,7 @@ def _open_cohorts(
             "status": raw.get("status"),
             "holding_days": (last_date - signal_date).days,
             "symbols": ",".join(symbols),
-            "market_value": sum(position_map.get(code, 0.0) for code in symbols),
+            "market_value": sum(values.values()),
             "retry_count": int(raw.get("retry_count", 0)),
             "last_failure_reason": ",".join(sorted({
                 failure_map[code] for code in symbols if code in failure_map
@@ -125,7 +155,8 @@ class MomentumReport:
         fills = frames.get("fills", pd.DataFrame())
         positions = frames.get("positions", pd.DataFrame())
         nav = frames.get("nav", pd.DataFrame())
-        open_cohorts = _open_cohorts(states, positions, fills)
+        allocations = frames.get("fill_allocations", pd.DataFrame())
+        open_cohorts = _open_cohorts(states, positions, fills, allocations)
         yearly_performance, trimmed_performance = _yearly_performance(nav)
 
         fill_summary = pd.DataFrame()
@@ -154,7 +185,6 @@ class MomentumReport:
             )
 
         execution_metrics: dict[str, Any] = {}
-        allocations = frames.get("fill_allocations", pd.DataFrame())
         slippage_cost = (
             float(allocations["slippage_cost"].sum())
             if not allocations.empty else 0.0

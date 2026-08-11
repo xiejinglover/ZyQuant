@@ -257,6 +257,26 @@ def test_open_cohort_report_ignores_stale_state_without_position() -> None:
     assert _open_cohorts(states, positions, fills).empty
 
 
+def test_open_cohort_report_applies_sells_after_last_position_snapshot() -> None:
+    states = pd.DataFrame([{
+        "date": date(2025, 1, 3),
+        "state_json": '{"cohorts":{"old":{"signal_date":"2025-01-01",'
+        '"symbols":["600001.XSHG"],"status":"exit_pending"}}}',
+    }])
+    positions = pd.DataFrame([{
+        "date": date(2025, 1, 2), "instrument_id": "600001.XSHG",
+        "quantity": 40, "last_price": 10.0, "market_value": 400.0,
+    }])
+    fills = pd.DataFrame(columns=[
+        "side", "reject_reason", "execution_date", "instrument_id",
+    ])
+    allocations = pd.DataFrame([{
+        "execution_date": date(2025, 1, 3), "side": "sell", "quantity": 40,
+        "instrument_id": "600001.XSHG", "cohort_id": "old",
+    }])
+    assert _open_cohorts(states, positions, fills, allocations).empty
+
+
 def test_hold_limit_up_close_executor_only_blocks_required_sells():
     executor = HoldLimitUpCloseExecutor(ExecutionConfig(
         max_participation=1.0,
