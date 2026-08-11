@@ -50,3 +50,19 @@ cd /data/zzh/ZyQuant
 
 缓存构建只覆盖沪深普通 A 股，不输出北交所和 B 股；审计目录记录每个因子的
 定义、cache key、覆盖率和耗时。横截面排名将在后续 EMA20 事件样本中计算。
+
+## 3年训练 / 1年样本外数据集
+
+```bash
+/data/zzh/envs/zyquant-2.0/bin/python -P \
+  /data/zzh/ZyQuant/strategies/ml_ema20_momentum_v1/build_dataset.py \
+  --root /data/zzh/ZyQuant/data \
+  --dataset hermes-cn-a-2010-20260724-v4 \
+  --cache-root /data/zzh/ZyQuant/.zyquant/cache/factors \
+  --factor-manifest /data/zzh/ZyQuant/runs/ml_ema20_momentum_v1/factors/cache_manifest.json \
+  --output /data/zzh/ZyQuant/runs/ml_ema20_momentum_v1/datasets/rolling_3y_1y_v1
+```
+
+标签为 `close_post[T+2] / open_post[T+1] - 1`。原始 labeled panel 保留特征
+NaN 供审计；各年 fold 只排除标签不可用的行，特征 NaN 保留给后续
+“仅训练集拟合”的缺失处理。±Inf 不会被静默替换。
