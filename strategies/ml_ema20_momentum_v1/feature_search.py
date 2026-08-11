@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import sys
 import tempfile
 import time
 from typing import Any, Iterable, Mapping, Sequence
@@ -17,12 +18,18 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from zyquant.core.exceptions import StrategyError
-from zyquant.core.hashing import hash_file, hash_payload
-from zyquant.experiment.store import ExperimentStore
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from .dataset import LABEL_COLUMN, MODEL_FEATURES
-from .xgb_training import (
+from zyquant.core.exceptions import StrategyError  # noqa: E402
+from zyquant.core.hashing import hash_file, hash_payload  # noqa: E402
+from zyquant.experiment.store import ExperimentStore  # noqa: E402
+
+from strategies.ml_ema20_momentum_v1.dataset import (  # noqa: E402
+    LABEL_COLUMN, MODEL_FEATURES,
+)
+from strategies.ml_ema20_momentum_v1.xgb_training import (  # noqa: E402
     fit_early_stopping,
     make_relevance,
     predict,
