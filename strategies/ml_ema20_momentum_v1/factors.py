@@ -342,16 +342,27 @@ def _one_instrument(group: pd.DataFrame) -> pd.DataFrame:
     ).corr(volume_change).to_numpy()
 
     spread = high - low
-    valid_spread = spread > 0
-    output["upper_shadow_ratio"] = np.where(
-        valid_spread, (high - np.maximum(opened, close)) / spread, 0.0
+    valid_spread = np.isfinite(spread) & (spread > 0)
+    upper_shadow = np.full(len(group), np.nan)
+    lower_shadow = np.full(len(group), np.nan)
+    body = np.full(len(group), np.nan)
+    upper_shadow[spread <= 0] = 0.0
+    lower_shadow[spread <= 0] = 0.0
+    body[spread <= 0] = 0.0
+    np.divide(
+        high - np.maximum(opened, close), spread,
+        out=upper_shadow, where=valid_spread,
     )
-    output["lower_shadow_ratio"] = np.where(
-        valid_spread, (np.minimum(opened, close) - low) / spread, 0.0
+    np.divide(
+        np.minimum(opened, close) - low, spread,
+        out=lower_shadow, where=valid_spread,
     )
-    output["body_ratio"] = np.where(
-        valid_spread, np.abs(close - opened) / spread, 0.0
+    np.divide(
+        np.abs(close - opened), spread, out=body, where=valid_spread,
     )
+    output["upper_shadow_ratio"] = upper_shadow
+    output["lower_shadow_ratio"] = lower_shadow
+    output["body_ratio"] = body
     output["intraday_return"] = close / opened - 1.0
     output["overnight_gap"] = opened / previous_close - 1.0
     output[list(FEATURE_NAMES)] = output[list(FEATURE_NAMES)].replace(
