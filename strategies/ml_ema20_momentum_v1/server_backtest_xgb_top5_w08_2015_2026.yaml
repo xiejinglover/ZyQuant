@@ -1,0 +1,51 @@
+schema_version: "1.0"
+run_type: backtest
+data:
+  root: /data/zzh/ZyQuant/data
+  dataset_id: hermes-cn-a-2010-20260724-v4
+  start_date: 2015-01-05
+  end_date: 2026-07-24
+  verify_hashes: true
+factor:
+  cache_root: /data/zzh/ZyQuant/.zyquant/cache/factors
+  cache_policy: require
+  factors: []
+strategy:
+  strategies:
+    - plugin: strategies.ml_ema20_momentum_v1.plugin:create_strategy
+      strategy_id: ml_ema20_momentum_v1_xgb_ranker_top5_w08
+      capital_weight: 1.0
+      parameters:
+        strategy_id: ml_ema20_momentum_v1_xgb_ranker_top5_w08
+        prediction_path: /data/zzh/ZyQuant/runs/ml_ema20_momentum_v1/predictions/xgb_ranker_3y1y_v1.parquet
+        top_k: 5
+        instrument_weight: 0.08
+        cash_buffer: 0.01
+        ema_span: 20
+        minimum_listed_sessions: 120
+        minimum_median_amount: 50000000.0
+portfolio: {}
+execution:
+  model: strategies.ml_ema20_momentum_v1.execution:create_execution_model
+  model_parameters:
+    tolerance: 1.0e-8
+  timing: next_open
+  max_participation: 0.05
+  slippage_bps: 2.0
+  impact_coefficient_bps: 50.0
+  max_impact_bps: 100.0
+account:
+  initial_cash: 10000000
+analysis:
+  attribution: false
+  report: true
+  report_plugin: strategies.ml_ema20_momentum_v1.report:create_report
+search:
+  enabled: false
+seed: 20260722
+output_root: /data/zzh/ZyQuant/runs
+experiment_database: /data/zzh/ZyQuant/runs/experiments.sqlite
+metadata:
+  strategy: ml_ema20_momentum_v1
+  model: xgb_ranker_3y1y_v1_top5_w08
+  research_status: XGBoost Top5 8%权重对照回测
