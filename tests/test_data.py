@@ -79,6 +79,43 @@ class DataTests(unittest.TestCase):
             with self.assertRaises(DataContractError):
                 SnapshotPublisher(temporary).publish("bad-v1", tables, factors)
 
+    def test_validate_mode_publishes_event_factors_and_records_deviation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tables, days = canonical_tables()
+            factors = tables["daily_raw"][[
+                "trade_date", "instrument_id"
+            ]].copy()
+            factors["adjustment_factor"] = 1.0
+            snapshot = SnapshotPublisher(temporary).publish(
+                "validate-v1",
+                tables,
+                factors,
+                vendor_factor_mode="validate",
+                vendor_factor_rtol=1e-3,
+            )
+            self.assertEqual(
+                snapshot.manifest["adjustment"]["factor_source"],
+                "corporate_action",
+            )
+            quality = snapshot.manifest["quality"]["vendor_factors"]
+            self.assertEqual(quality["mode"], "validate")
+            self.assertEqual(quality["status"], "deviation_observed")
+            self.assertGreater(quality["mismatches"], 0)
+            self.assertGreater(quality["relative_deviation"]["max"], 0)
+
+    def test_off_mode_ignores_supplied_vendor_factors(self):
+        tables, _ = canonical_tables()
+        factors = tables["daily_raw"][["trade_date", "instrument_id"]].copy()
+        factors["adjustment_factor"] = -1.0
+        result = AdjustmentProcessor().build(
+            tables["daily_raw"],
+            tables["corporate_actions"],
+            factors,
+            vendor_factor_mode="off",
+        )
+        self.assertEqual(result.diagnostics.factor_source, "corporate_action")
+        self.assertEqual(result.diagnostics.vendor_factors["status"], "not_checked")
+
 
 if __name__ == "__main__":
     unittest.main()

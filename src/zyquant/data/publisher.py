@@ -15,7 +15,7 @@ from zyquant.core.exceptions import DataContractError
 from zyquant.core.hashing import canonical_json, hash_file, hash_payload
 from zyquant.core.versioning import SNAPSHOT_SCHEMA_VERSION
 
-from .adjustment import AdjustmentProcessor
+from .adjustment import AdjustmentProcessor, VENDOR_FACTOR_RTOL
 from .contracts import (
     BASE_TABLES, FIELD_SPECS, FINANCIAL_TABLES,
 )
@@ -38,6 +38,8 @@ class SnapshotPublisher:
         schema_version: str = "1.0",
         as_of_date: date | None = None,
         lineage: Mapping[str, object] | None = None,
+        vendor_factor_mode: str = "use",
+        vendor_factor_rtol: float = VENDOR_FACTOR_RTOL,
     ) -> DataSnapshot:
         final = self.datasets_root / dataset_id
         if final.exists():
@@ -63,7 +65,11 @@ class SnapshotPublisher:
         if financial_present and schema_version == "1.0":
             schema_version = "1.1"
         adjusted = AdjustmentProcessor().build(
-            working["daily_raw"], working["corporate_actions"], vendor_factors
+            working["daily_raw"],
+            working["corporate_actions"],
+            vendor_factors,
+            vendor_factor_mode,
+            vendor_factor_rtol,
         )
         working["daily_post_adjusted"] = adjusted.daily_post_adjusted
         normalized = SnapshotValidator().validate(working)
@@ -156,6 +162,9 @@ class SnapshotPublisher:
                     },
                     "raw_adjusted_key_match": True,
                     "adjustment_rows": adjusted.diagnostics.rows,
+                    "vendor_factors": dict(
+                        adjusted.diagnostics.vendor_factors
+                    ),
                 },
             }
             (staging / "manifest.json").write_text(
@@ -180,6 +189,8 @@ class SnapshotPublisher:
             dataset_id, batch.tables, batch.vendor_factors,
             schema_version=schema_version, as_of_date=as_of_date,
             lineage=batch.source_metadata,
+            vendor_factor_mode=batch.vendor_factor_mode,
+            vendor_factor_rtol=batch.vendor_factor_rtol,
         )
 
     @staticmethod

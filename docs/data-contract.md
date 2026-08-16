@@ -33,6 +33,22 @@
 
 v1 支持现金分红、送转、拆分和合并。JQData 股票事件来自 `STK_XR_XD`，
 ETF 分红与拆并来自 `FUND_DIVIDEND`。无法可靠标准化的复杂事件不能静默近似。
+聚宽的现金分红、送股和转增比例分别从 `bonus_ratio_rmb`、
+`dividend_ratio` 和 `transfer_ratio` 标准化；finance 查询按递增 `id`
+分页，不允许将单次 5000 行上限当作完整结果。
+
+JQData 请求的 `vendor_factor_mode` 支持三种模式：
+
+- `off` 不下载厂商复权因子，只使用公司行动推导因子。
+- `validate` 下载并审计厂商因子，但使用公司行动因子发布；这是
+  JQData 的默认值。
+- `use` 仅在所有偏离都不超过 `vendor_factor_rtol` 时使用厂商因子，
+  否则拒绝发布。
+
+JQData 的默认容差为 `1e-3`。审计结果写入
+`manifest.quality.vendor_factors`，包括比较行数、超限行数、超限比例和
+相对偏离分位数。通用发布接口为了向后兼容，仍默认为 `use`
+和 `5e-7`。
 
 ## 时间可见性
 

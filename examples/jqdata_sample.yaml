@@ -10,6 +10,9 @@ batch_size: 20
 price_scope: explicit
 strict_permissions: true
 max_retries: 2
+# off: 不请求厂商因子；validate: 审计但使用公司行动因子；use: 校验后使用厂商因子
+vendor_factor_mode: validate
+vendor_factor_rtol: 0.001
 financial:
   enabled: true
   report_start_date: 2020-01-01

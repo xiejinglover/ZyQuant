@@ -97,6 +97,8 @@ class JQDataRequest:
     price_scope: str = "explicit"
     strict_permissions: bool = True
     max_retries: int = 2
+    vendor_factor_mode: str = "validate"
+    vendor_factor_rtol: float = 1e-3
     etf_sell_delay_overrides: tuple[tuple[str, int], ...] = ()
     financial: JQFinancialRequest | None = None
 
@@ -115,6 +117,17 @@ class JQDataRequest:
             )
         if self.max_retries < 0:
             raise ValueError("JQDataRequest.max_retries must be non-negative")
+        if self.vendor_factor_mode not in {"off", "validate", "use"}:
+            raise ValueError(
+                "JQDataRequest.vendor_factor_mode must be 'off', 'validate', or 'use'"
+            )
+        if (
+            not np.isfinite(self.vendor_factor_rtol)
+            or self.vendor_factor_rtol < 0
+        ):
+            raise ValueError(
+                "JQDataRequest.vendor_factor_rtol must be finite and non-negative"
+            )
         for instrument, delay in self.etf_sell_delay_overrides:
             if instrument not in self.instruments or delay < 0:
                 raise ValueError("invalid ETF sell-delay override")
@@ -166,6 +179,8 @@ class JQDataRequest:
             "price_scope": self.price_scope,
             "strict_permissions": self.strict_permissions,
             "max_retries": self.max_retries,
+            "vendor_factor_mode": self.vendor_factor_mode,
+            "vendor_factor_rtol": self.vendor_factor_rtol,
             "etf_sell_delay_overrides": dict(self.etf_sell_delay_overrides),
             "financial": (
                 self.financial.public_payload()
@@ -302,6 +317,9 @@ class JQDataSDKClient:
             fill_paused=True,
             round=False,
         )
+        raw = self._flat_price_response(raw, instruments)
+        if "factor" not in fields:
+            return raw
         factors = self._sdk.get_price(
             list(instruments),
             start_date=start_date,
@@ -314,7 +332,6 @@ class JQDataSDKClient:
             fill_paused=True,
             round=False,
         )
-        raw = self._flat_price_response(raw, instruments)
         factors = self._flat_price_response(factors, instruments)
         keys = ["time", "code"]
         if factors.duplicated(keys).any():
@@ -353,24 +370,26 @@ class JQDataSDKClient:
     ) -> pd.DataFrame:
         try:
             stock_table = self._sdk.finance.STK_XR_XD
-            stock_query = self._sdk.query(stock_table).filter(
-                stock_table.code.in_(list(instruments)),
+            stock = self._finance_paged(
+                stock_table,
+                instruments,
                 stock_table.a_xr_date >= start_date,
                 stock_table.a_xr_date <= end_date,
-            ).limit(5000)
-            stock = self._sdk.finance.run_query(stock_query)
+            )
             stock["source_table"] = "STK_XR_XD"
 
             fund_table = self._sdk.finance.FUND_DIVIDEND
             local_codes = [code.split(".", 1)[0] for code in instruments]
-            fund_query = self._sdk.query(fund_table).filter(
-                fund_table.code.in_(local_codes),
+            fund = self._finance_paged(
+                fund_table,
+                local_codes,
                 fund_table.ex_date >= start_date,
                 fund_table.ex_date <= end_date,
-            ).limit(5000)
-            fund = self._sdk.finance.run_query(fund_query)
+            )
             fund["source_table"] = "FUND_DIVIDEND"
             return pd.concat([stock, fund], ignore_index=True, sort=False)
+        except DataContractError:
+            raise
         except Exception as exc:
             self._raise_sanitized("corporate-actions query", exc)
 
@@ -469,8 +488,22 @@ class JQDataSDKClient:
                     )
                 if frame.empty:
                     break
+                if "id" not in frame:
+                    raise DataContractError(
+                        "JQData finance pagination response is missing id"
+                    )
+                ids = pd.to_numeric(frame["id"], errors="coerce")
+                numeric_ids = ids.to_numpy(dtype=float)
+                if (
+                    ids.isna().any()
+                    or not np.isfinite(numeric_ids).all()
+                    or not np.allclose(numeric_ids, np.round(numeric_ids))
+                ):
+                    raise DataContractError(
+                        "JQData finance pagination response contains invalid id"
+                    )
                 outputs.append(frame)
-                next_id = int(pd.to_numeric(frame["id"]).max())
+                next_id = int(ids.max())
                 if next_id <= last_id:
                     raise DataContractError(
                         "JQData finance pagination did not advance"
@@ -482,9 +515,15 @@ class JQDataSDKClient:
             raise
         except Exception as exc:
             self._raise_sanitized("finance query", exc)
+        if not outputs:
+            return pd.DataFrame()
+        result = pd.concat(outputs, ignore_index=True, sort=False)
+        result["_pagination_id"] = pd.to_numeric(result["id"])
         return (
-            pd.concat(outputs, ignore_index=True, sort=False)
-            if outputs else pd.DataFrame()
+            result.sort_values("_pagination_id")
+            .drop_duplicates("_pagination_id")
+            .drop(columns="_pagination_id")
+            .reset_index(drop=True)
         )
 
     def _raise_sanitized(self, operation: str, exc: Exception) -> None:
@@ -513,6 +552,7 @@ class JQDataAdapter:
         ("cash_per_share", 1.0),
     )
     BONUS_FIELDS = (
+        ("dividend_ratio", 10.0),
         ("bonus_ratio", 10.0),
         ("bonus_share_ratio", 10.0),
     )
@@ -645,7 +685,9 @@ class JQDataAdapter:
             "query_count_before": self._safe_metadata(before),
             "query_count_after": self._safe_metadata(after),
             "source_table_hashes": table_hashes,
-            "vendor_factor_hash": self._frame_hash(factors),
+            "vendor_factor_hash": (
+                self._frame_hash(factors) if factors is not None else None
+            ),
             "visibility_assumptions": {
                 "industry_known_at": "effective_from",
                 "universe_known_at": "effective_from",
@@ -685,7 +727,13 @@ class JQDataAdapter:
             "warnings": list(self._warnings),
             "market_rules": "demo-scenario; replace before production use",
         }
-        return CanonicalBatch(tables, factors, metadata)
+        return CanonicalBatch(
+            tables=tables,
+            vendor_factors=factors,
+            source_metadata=metadata,
+            vendor_factor_mode=resolved.vendor_factor_mode,
+            vendor_factor_rtol=resolved.vendor_factor_rtol,
+        )
 
     @staticmethod
     def _resolve_request(
@@ -889,8 +937,13 @@ class JQDataAdapter:
         request: JQDataRequest,
         batch_id: str,
         instruments: Sequence[str],
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
         outputs = []
+        fields = (
+            tuple(field for field in self.PRICE_FIELDS if field != "factor")
+            if request.vendor_factor_mode == "off"
+            else self.PRICE_FIELDS
+        )
         for start in range(0, len(instruments), request.batch_size):
             batch = instruments[start:start + request.batch_size]
             frame = self._call(
@@ -900,18 +953,21 @@ class JQDataAdapter:
                 batch,
                 request.start_date,
                 request.end_date,
-                self.PRICE_FIELDS,
+                fields,
             )
-            outputs.append(self._price_frame(frame, batch))
+            outputs.append(self._price_frame(frame, batch, fields))
         source = pd.concat(outputs, ignore_index=True, sort=False)
         source = source[source["instrument_id"].isin(instruments)].copy()
         price_columns = ["open", "high", "low", "close", "pre_close"]
         source = source[~source[price_columns].isna().all(axis=1)].copy()
         if source.empty:
             raise DataContractError("JQData returned no usable daily prices")
-        if source[price_columns + ["factor"]].isna().any().any():
+        required_values = price_columns + (
+            ["factor"] if request.vendor_factor_mode != "off" else []
+        )
+        if source[required_values].isna().any().any():
             bad = source.loc[
-                source[price_columns + ["factor"]].isna().any(axis=1),
+                source[required_values].isna().any(axis=1),
                 ["trade_date", "instrument_id"],
             ].head(5)
             raise DataContractError(
@@ -919,9 +975,13 @@ class JQDataAdapter:
                 f"filling: {bad.to_dict('records')}"
             )
 
-        factors = source[
-            ["trade_date", "instrument_id", "factor"]
-        ].rename(columns={"factor": "adjustment_factor"})
+        factors = (
+            source[["trade_date", "instrument_id", "factor"]].rename(
+                columns={"factor": "adjustment_factor"}
+            )
+            if request.vendor_factor_mode != "off"
+            else None
+        )
         raw = source.rename(columns={
             "money": "amount",
             "high_limit": "limit_up",
@@ -949,13 +1009,19 @@ class JQDataAdapter:
         ]]
         return (
             raw.sort_values(["trade_date", "instrument_id"], ignore_index=True),
-            factors.sort_values(["trade_date", "instrument_id"], ignore_index=True),
+            (
+                factors.sort_values(
+                    ["trade_date", "instrument_id"], ignore_index=True
+                )
+                if factors is not None else None
+            ),
         )
 
     @staticmethod
     def _price_frame(
         frame: pd.DataFrame,
         instruments: Sequence[str],
+        fields: Sequence[str] | None = None,
     ) -> pd.DataFrame:
         if not isinstance(frame, pd.DataFrame):
             raise DataContractError("JQData get_price must return DataFrame")
@@ -983,7 +1049,7 @@ class JQDataAdapter:
             date_column: "trade_date",
             code_column: "instrument_id",
         }, inplace=True)
-        required = set(JQDataAdapter.PRICE_FIELDS) | {
+        required = set(fields or JQDataAdapter.PRICE_FIELDS) | {
             "trade_date", "instrument_id",
         }
         missing = required - set(result)

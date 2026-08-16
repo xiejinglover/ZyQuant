@@ -15,6 +15,8 @@ class CanonicalBatch:
     tables: Mapping[str, pd.DataFrame]
     vendor_factors: pd.DataFrame | None = None
     source_metadata: Mapping[str, Any] = field(default_factory=dict)
+    vendor_factor_mode: str = "use"
+    vendor_factor_rtol: float = 5e-7
 
 
 class DataSourceAdapter(Protocol):

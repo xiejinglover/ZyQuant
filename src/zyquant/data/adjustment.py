@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 
 import numpy as np
 import pandas as pd
 
 from zyquant.core.exceptions import DataContractError
 
-ADJUSTMENT_VERSION = "1.1"
+ADJUSTMENT_VERSION = "1.2"
 # JQData publishes daily factors rounded to six decimal places. Comparing a
 # normalized ratio of two such values needs a slightly wider tolerance than
 # machine precision, while remaining far below a market price tick.
@@ -20,6 +21,7 @@ class AdjustmentDiagnostics:
     rows: int
     factor_source: str
     event_adjustments: int
+    vendor_factors: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -37,11 +39,28 @@ class AdjustmentProcessor:
         raw_bars: pd.DataFrame,
         corporate_actions: pd.DataFrame,
         vendor_factors: pd.DataFrame | None = None,
+        vendor_factor_mode: str = "use",
+        vendor_factor_rtol: float = VENDOR_FACTOR_RTOL,
     ) -> AdjustedBarsResult:
+        if vendor_factor_mode not in {"off", "validate", "use"}:
+            raise ValueError(
+                "vendor_factor_mode must be 'off', 'validate', or 'use'"
+            )
+        if (
+            not np.isfinite(vendor_factor_rtol)
+            or vendor_factor_rtol < 0
+        ):
+            raise ValueError("vendor_factor_rtol must be finite and non-negative")
         raw = raw_bars.sort_values(
             ["instrument_id", "trade_date"], ignore_index=True
         ).copy()
-        factors, source, event_count = self._factors(raw, corporate_actions, vendor_factors)
+        factors, source, event_count, vendor_diagnostics = self._factors(
+            raw,
+            corporate_actions,
+            vendor_factors,
+            vendor_factor_mode,
+            vendor_factor_rtol,
+        )
         result = raw[["trade_date", "instrument_id"]].copy()
         result["adjustment_factor"] = factors.to_numpy(dtype=float)
         for raw_name, post_name in (
@@ -75,6 +94,7 @@ class AdjustmentProcessor:
                 rows=len(raw),
                 factor_source=source,
                 event_adjustments=event_count,
+                vendor_factors=vendor_diagnostics,
             ),
         )
 
@@ -83,7 +103,19 @@ class AdjustmentProcessor:
         raw: pd.DataFrame,
         actions: pd.DataFrame,
         vendor: pd.DataFrame | None,
-    ) -> tuple[pd.Series, str, int]:
+        mode: str,
+        rtol: float,
+    ) -> tuple[pd.Series, str, int, Mapping[str, object]]:
+        expected, event_count = self._event_factors(raw, actions)
+        if mode == "off":
+            return expected, "corporate_action", event_count, {
+                "mode": mode,
+                "status": "not_checked",
+                "rtol": rtol,
+                "rows": 0,
+                "mismatches": 0,
+                "mismatch_rate": 0.0,
+            }
         if vendor is not None:
             required = {"trade_date", "instrument_id", "adjustment_factor"}
             if required - set(vendor.columns):
@@ -97,24 +129,59 @@ class AdjustmentProcessor:
             if values.isna().any() or (values <= 0).any() or not np.isfinite(values).all():
                 raise DataContractError("vendor adjustment factors must be finite and positive")
             normalized = values / values.groupby(raw["instrument_id"].to_numpy()).transform("first")
-            expected, _, event_count = self._factors(raw, actions, None)
-            if not np.allclose(
-                normalized.to_numpy(dtype=float), expected.to_numpy(dtype=float),
-                rtol=VENDOR_FACTOR_RTOL, atol=1e-10,
-            ):
+            vendor_values = normalized.to_numpy(dtype=float)
+            expected_values = expected.to_numpy(dtype=float)
+            mismatched = ~np.isclose(
+                vendor_values, expected_values, rtol=rtol, atol=1e-10,
+            )
+            relative = np.abs(vendor_values / expected_values - 1.0)
+            mismatch_count = int(mismatched.sum())
+            diagnostics: Mapping[str, object] = {
+                "mode": mode,
+                "status": (
+                    "deviation_observed" if mismatch_count else "within_tolerance"
+                ),
+                "rtol": rtol,
+                "rows": len(relative),
+                "mismatches": mismatch_count,
+                "mismatch_rate": mismatch_count / len(relative) if len(relative) else 0.0,
+                "relative_deviation": {
+                    "median": float(np.quantile(relative, 0.50)),
+                    "p95": float(np.quantile(relative, 0.95)),
+                    "p99": float(np.quantile(relative, 0.99)),
+                    "max": float(relative.max()),
+                },
+            }
+            if mode == "use" and mismatch_count:
                 mismatch = raw.loc[
-                    ~np.isclose(
-                        normalized.to_numpy(dtype=float), expected.to_numpy(dtype=float),
-                        rtol=VENDOR_FACTOR_RTOL, atol=1e-10,
-                    ),
+                    mismatched,
                     ["trade_date", "instrument_id"],
                 ].head(5)
                 raise DataContractError(
                     "vendor factors conflict with canonical corporate actions: "
                     f"{mismatch.to_dict('records')}"
                 )
-            return normalized.reset_index(drop=True), "vendor", event_count
+            if mode == "use":
+                return (
+                    normalized.reset_index(drop=True), "vendor", event_count,
+                    diagnostics,
+                )
+            return expected, "corporate_action", event_count, diagnostics
 
+        return expected, "corporate_action", event_count, {
+            "mode": mode,
+            "status": "not_available",
+            "rtol": rtol,
+            "rows": 0,
+            "mismatches": 0,
+            "mismatch_rate": 0.0,
+        }
+
+    def _event_factors(
+        self,
+        raw: pd.DataFrame,
+        actions: pd.DataFrame,
+    ) -> tuple[pd.Series, int]:
         active = actions.copy()
         if not active.empty:
             active = active[~active["status"].astype(str).str.lower().isin({"cancelled", "canceled", "取消"})]
@@ -193,4 +260,4 @@ class AdjustmentProcessor:
                     event_count += len(events)
                 output[index] = factor
                 previous_close = float(raw.loc[index, "close"])
-        return pd.Series(output, index=raw.index).reset_index(drop=True), "corporate_action", event_count
+        return pd.Series(output, index=raw.index).reset_index(drop=True), event_count

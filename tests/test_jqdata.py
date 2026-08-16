@@ -201,6 +201,16 @@ class JQDataAdapterTests(unittest.TestCase):
             with self.assertRaises(DataContractError):
                 JQDataCredentials.from_env()
 
+    def test_vendor_factor_options_are_validated(self):
+        for overrides in (
+            {"vendor_factor_mode": "unknown"},
+            {"vendor_factor_rtol": -1.0},
+            {"vendor_factor_rtol": float("nan")},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValueError):
+                    self.request(**overrides)
+
     def test_sdk_wrapper_fetches_post_factor_separately_from_raw_prices(self):
         class SDK:
             def __init__(self):
@@ -233,6 +243,172 @@ class JQDataAdapterTests(unittest.TestCase):
         )
         self.assertEqual(client._sdk.fq_values, [None, "post"])
         self.assertEqual(result.iloc[0]["factor"], 2.0)
+
+    def test_sdk_wrapper_does_not_fetch_factor_when_not_requested(self):
+        class SDK:
+            def __init__(self):
+                self.fq_values = []
+
+            def get_price(self, instruments, **kwargs):
+                self.fq_values.append(kwargs["fq"])
+                return pd.DataFrame({
+                    "time": [pd.Timestamp("2025-01-02")],
+                    "code": [instruments[0]],
+                    "close": [10.0],
+                })
+
+        client = object.__new__(JQDataSDKClient)
+        client._sdk = SDK()
+        result = client.get_price(
+            ["600000.XSHG"],
+            date(2025, 1, 2),
+            date(2025, 1, 2),
+            ["close"],
+        )
+        self.assertEqual(client._sdk.fq_values, [None])
+        self.assertNotIn("factor", result)
+
+    def test_corporate_actions_query_pages_both_finance_tables(self):
+        class Column:
+            def __init__(self, name):
+                self.name = name
+
+            def in_(self, values):
+                return ("in", self.name, tuple(values))
+
+            def __ge__(self, value):
+                return ("ge", self.name, value)
+
+            def __le__(self, value):
+                return ("le", self.name, value)
+
+            def __gt__(self, value):
+                return ("gt", self.name, value)
+
+            def asc(self):
+                return ("asc", self.name)
+
+        class Table:
+            def __init__(self, name):
+                self.name = name
+                for column in ("id", "code", "a_xr_date", "ex_date"):
+                    setattr(self, column, Column(column))
+
+        class Query:
+            def __init__(self, table):
+                self.table = table
+                self.conditions = ()
+
+            def filter(self, *conditions):
+                self.conditions = conditions
+                return self
+
+            def order_by(self, *_):
+                return self
+
+            def limit(self, _):
+                return self
+
+        stock_table = Table("stock")
+        fund_table = Table("fund")
+        rows = {
+            "stock": pd.DataFrame({
+                "id": range(1, 5002),
+                "code": ["000001.XSHE"] * 5001,
+            }),
+            "fund": pd.DataFrame({
+                "id": range(1, 5001),
+                "code": ["510300"] * 5000,
+            }),
+        }
+        calls = {"stock": 0, "fund": 0}
+
+        class Finance:
+            STK_XR_XD = stock_table
+            FUND_DIVIDEND = fund_table
+
+            @staticmethod
+            def run_query(query):
+                calls[query.table.name] += 1
+                last_id = next(
+                    condition[2] for condition in query.conditions
+                    if condition[:2] == ("gt", "id")
+                )
+                frame = rows[query.table.name]
+                return frame[frame["id"] > last_id].head(5000).copy()
+
+        class SDK:
+            finance = Finance()
+
+            @staticmethod
+            def query(table):
+                return Query(table)
+
+        client = object.__new__(JQDataSDKClient)
+        client._sdk = SDK()
+        result = client.get_corporate_actions(
+            ["000001.XSHE", "510300.XSHG"],
+            date(2013, 1, 1),
+            date(2026, 8, 14),
+        )
+        self.assertEqual(len(result), 10001)
+        self.assertEqual(calls, {"stock": 2, "fund": 2})
+        self.assertEqual(
+            result.groupby("source_table").size().to_dict(),
+            {"FUND_DIVIDEND": 5000, "STK_XR_XD": 5001},
+        )
+
+    def test_finance_pagination_rejects_missing_invalid_and_stalled_ids(self):
+        class Column:
+            def in_(self, values):
+                return values
+
+            def __gt__(self, value):
+                return value
+
+            def asc(self):
+                return self
+
+        class Table:
+            code = Column()
+            id = Column()
+
+        class Query:
+            def filter(self, *conditions):
+                return self
+
+            def order_by(self, *_):
+                return self
+
+            def limit(self, _):
+                return self
+
+        for frames in (
+            [pd.DataFrame({"code": ["x"]})],
+            [pd.DataFrame({"id": [float("nan")]})],
+            [pd.DataFrame({"id": [1.5]})],
+            [pd.DataFrame({"id": range(1, 5001)}),
+             pd.DataFrame({"id": range(1, 5001)})],
+        ):
+            with self.subTest(frames=len(frames)):
+                queue = list(frames)
+
+                class Finance:
+                    @staticmethod
+                    def run_query(_):
+                        return queue.pop(0)
+
+                class SDK:
+                    finance = Finance()
+
+                    @staticmethod
+                    def query(_):
+                        return Query()
+
+                client = object.__new__(JQDataSDKClient)
+                client._sdk = SDK()
+                with self.assertRaises(DataContractError):
+                    client._finance_paged(Table(), ["x"])
 
     def test_adjustment_uses_reconciled_exchange_reference_price(self):
         raw = pd.DataFrame([
@@ -327,6 +503,68 @@ class JQDataAdapterTests(unittest.TestCase):
         self.assertEqual(actions.iloc[0]["instrument_id"], "510300.XSHG")
         self.assertAlmostEqual(actions.iloc[0]["cash_per_share"], 0.088)
 
+    def test_dividend_ratio_is_normalized_as_bonus_shares(self):
+        fake = FakeJQDataClient()
+        fake.get_corporate_actions = lambda *args: pd.DataFrame([{
+            "id": 1,
+            "code": "000001.XSHE",
+            "a_xr_date": date(2013, 6, 20),
+            "implementation_pub_date": date(2013, 6, 14),
+            "plan_progress": "实施方案",
+            "bonus_ratio_rmb": 1.7,
+            "dividend_ratio": 6.0,
+            "bonus_ratio": 0.0,
+            "transfer_ratio": None,
+        }])
+        request = JQDataRequest(
+            start_date=date(2013, 1, 1),
+            end_date=date(2013, 12, 31),
+            instruments=("000001.XSHE",),
+            strict_permissions=False,
+        )
+        actions = JQDataAdapter(client=fake)._corporate_actions(
+            fake, request, "test-batch"
+        )
+        self.assertEqual(set(actions["event_type"]), {"cash_dividend", "bonus"})
+        bonus = actions[actions["event_type"] == "bonus"].iloc[0]
+        self.assertAlmostEqual(bonus["share_ratio"], 0.6)
+
+        raw = pd.DataFrame([
+            {
+                "trade_date": date(2013, 6, 19),
+                "instrument_id": "000001.XSHE",
+                "open": 19.24, "high": 19.24, "low": 19.24,
+                "close": 19.24, "pre_close": 19.73,
+            },
+            {
+                "trade_date": date(2013, 6, 20),
+                "instrument_id": "000001.XSHE",
+                "open": 11.18, "high": 11.18, "low": 11.18,
+                "close": 11.18, "pre_close": 11.92,
+            },
+        ])
+        adjusted = AdjustmentProcessor().build(raw, actions)
+        self.assertAlmostEqual(
+            adjusted.daily_post_adjusted.iloc[1]["adjustment_factor"],
+            19.24 / 11.92,
+        )
+
+    def test_jqdata_vendor_factor_defaults_and_off_mode(self):
+        request = self.request()
+        self.assertEqual(request.vendor_factor_mode, "validate")
+        self.assertEqual(request.vendor_factor_rtol, 1e-3)
+        self.assertEqual(request.public_payload()["vendor_factor_mode"], "validate")
+
+        fake = FakeJQDataClient()
+        batch = JQDataAdapter(client=fake).ingest(
+            self.request(vendor_factor_mode="off")
+        )
+        self.assertIsNone(batch.vendor_factors)
+        self.assertEqual(batch.vendor_factor_mode, "off")
+        self.assertTrue(all(
+            "factor" not in fields for _, fields in fake.price_calls
+        ))
+
     def test_adapter_maps_and_publishes_complete_sample(self):
         fake = FakeJQDataClient()
         adapter = JQDataAdapter(client=fake)
@@ -408,6 +646,17 @@ class JQDataAdapterTests(unittest.TestCase):
             )
             self.assertEqual(len(raw), len(post))
             self.assertAlmostEqual(post.iloc[1]["close_post"], 10.0)
+            self.assertEqual(
+                snapshot.manifest["adjustment"]["algorithm_version"], "1.2"
+            )
+            self.assertEqual(
+                snapshot.manifest["adjustment"]["factor_source"],
+                "corporate_action",
+            )
+            self.assertEqual(
+                snapshot.manifest["quality"]["vendor_factors"]["mode"],
+                "validate",
+            )
             reopened = ParquetDataProvider(temporary).open_snapshot("jqdata-test")
             self.assertEqual(
                 reopened.metadata.fingerprint,
