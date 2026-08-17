@@ -101,6 +101,81 @@ def allocate_fill_quantities(
     return {key: value for key, value in allocated.items() if value > 0}
 
 
+def allocate_fill_demands(
+    order: MasterOrder,
+    filled_quantity: int,
+    demands: list[SleeveDemand],
+) -> dict[tuple[str, str | None, str | None], int]:
+    """Allocate a fill without collapsing distinct cohorts of one strategy."""
+    if filled_quantity <= 0 or not demands:
+        return {}
+    keys = [
+        (item.strategy_id, item.cohort_id, item.demand_id)
+        for item in demands
+    ]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate sleeve demand allocation key")
+    total = sum(item.quantity for item in demands)
+    lot = order.lot_size
+    requested = {key: item.quantity for key, item in zip(keys, demands)}
+    raw = {key: filled_quantity * requested[key] / total for key in keys}
+    allocated = {
+        key: math.floor(value / lot) * lot for key, value in raw.items()
+    }
+    remaining = filled_quantity - sum(allocated.values())
+    for key in sorted(
+        keys, key=lambda item: (-(raw[item] - allocated[item]), item),
+    ):
+        if remaining < lot:
+            break
+        if allocated[key] + lot <= requested[key]:
+            allocated[key] += lot
+            remaining -= lot
+    return {key: value for key, value in allocated.items() if value > 0}
+
+
+def cost_demand_allocations(
+    order: MasterOrder,
+    quantity_by_demand: dict[tuple[str, str | None, str | None], int],
+    price: float,
+    commission: float,
+    tax: float,
+    slippage_bps: float,
+) -> list[FillAllocation]:
+    """Split order costs over cohort-aware allocations deterministically."""
+    total = sum(quantity_by_demand.values())
+    if total <= 0:
+        return []
+    result = []
+    assigned_commission = assigned_tax = assigned_slippage = 0.0
+    keys = sorted(quantity_by_demand)
+    total_slippage = total * abs(price - order.reference_price)
+    for index, key in enumerate(keys):
+        strategy_id, cohort_id, demand_id = key
+        quantity = quantity_by_demand[key]
+        if index == len(keys) - 1:
+            current_commission = commission - assigned_commission
+            current_tax = tax - assigned_tax
+            current_slippage = total_slippage - assigned_slippage
+        else:
+            ratio = quantity / total
+            current_commission = commission * ratio
+            current_tax = tax * ratio
+            current_slippage = total_slippage * ratio
+            assigned_commission += current_commission
+            assigned_tax += current_tax
+            assigned_slippage += current_slippage
+        allocation_suffix = demand_id or cohort_id or "default"
+        result.append(FillAllocation(
+            order.order_id, order.execution_date, strategy_id,
+            order.instrument_id, order.side, quantity, price,
+            current_commission, current_tax, current_slippage,
+            f"{order.order_id}:allocation:{strategy_id}:{allocation_suffix}",
+            cohort_id,
+        ))
+    return result
+
+
 def cost_allocations(
     order: MasterOrder,
     quantity_by_strategy: dict[str, int],

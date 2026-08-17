@@ -35,6 +35,10 @@ strategy:
         max_industry_weight: 0.30
 portfolio: {}
 execution:
+  # Delisted shares are retained, frozen, and valued at the last causal mark.
+  # Alternatives: write_off_zero, cash_settle_last_close.
+  delisting_policy: carry_last_mark
+  delisting_recovery_rate: 1.0
   timing: next_open
   max_participation: 0.05
   slippage_bps: 2.0

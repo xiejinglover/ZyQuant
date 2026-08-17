@@ -7,7 +7,10 @@ from .constructors import (
     ScoreWeightedConstructor, TopKDropoutConstructor, TopKEqualWeightConstructor,
 )
 from .optimizer import OptimizerResult, PortfolioOptimizer, PortfolioProblem
-from .sleeve import allocate_fill_quantities, cost_allocations, net_sleeve_demands
+from .sleeve import (
+    allocate_fill_demands, allocate_fill_quantities, cost_allocations,
+    cost_demand_allocations, net_sleeve_demands,
+)
 
 __all__ = [
     "CapitalAllocator", "FixedCapitalAllocator", "ConstraintEngine",
@@ -15,6 +18,7 @@ __all__ = [
     "ConstraintReport", "PortfolioConstraints", "ExternalTargetWeightsConstructor",
     "RiskParityConstructor", "ScoreWeightedConstructor", "TopKDropoutConstructor",
     "TopKEqualWeightConstructor", "OptimizerResult", "PortfolioOptimizer",
-    "PortfolioProblem", "allocate_fill_quantities", "cost_allocations",
+    "PortfolioProblem", "allocate_fill_demands", "allocate_fill_quantities",
+    "cost_allocations", "cost_demand_allocations",
     "net_sleeve_demands",
 ]

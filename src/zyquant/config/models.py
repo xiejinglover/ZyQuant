@@ -88,6 +88,22 @@ class ExecutionConfig(StrictModel):
     # Finer-grained overrides, keyed by asset_type ("stock", "etf"). These
     # reach buy_tax_bps and transfer_fee_bps, which no scalar above covers.
     cost_overrides: Mapping[str, CostOverride] = Field(default_factory=dict)
+    delisting_policy: Literal[
+        "carry_last_mark", "write_off_zero", "cash_settle_last_close"
+    ] = "carry_last_mark"
+    delisting_recovery_rate: float = Field(default=1.0, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_delisting_policy(self) -> "ExecutionConfig":
+        if (
+            self.delisting_policy != "cash_settle_last_close"
+            and self.delisting_recovery_rate != 1.0
+        ):
+            raise ValueError(
+                "delisting_recovery_rate may only differ from 1.0 when "
+                "delisting_policy='cash_settle_last_close'"
+            )
+        return self
 
 
 class ConstraintConfig(StrictModel):

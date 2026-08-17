@@ -46,7 +46,7 @@ class StandardUniverseSelector:
             if row.list_date and (day - row.list_date).days < self.minimum_listed_days:
                 reasons.append({"instrument_id": code, "reason_code": "listed_days"})
                 continue
-            if getattr(row, "delist_date", None) and row.delist_date < day:
+            if getattr(row, "delist_date", None) and row.delist_date <= day:
                 reasons.append({"instrument_id": code, "reason_code": "delisted"})
                 continue
             history = raw[raw["instrument_id"] == code].sort_values("trade_date")

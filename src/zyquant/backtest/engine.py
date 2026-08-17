@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import inspect
+from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import date
@@ -17,7 +18,7 @@ from zyquant.core.hashing import canonical_json, hash_payload
 from zyquant.core.versioning import LEDGER_SCHEMA_VERSION, derive_seed
 from zyquant.data import DataSnapshot
 from zyquant.portfolio.sleeve import (
-    allocate_fill_quantities, cost_allocations, net_sleeve_demands,
+    allocate_fill_demands, cost_demand_allocations, net_sleeve_demands,
 )
 from zyquant.portfolio.capital import CapitalAllocator
 from zyquant.strategy.types import (
@@ -39,6 +40,13 @@ class StrategyBinding:
     strategy: Any
     capital_weight: float
     parameters: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _ValuationMark:
+    price: float
+    observed_date: date
+    paused: bool = False
 
 
 class _ActionEvent:
@@ -89,6 +97,34 @@ class _DayBars:
         if index is None:
             return None
         return _MarketRow(self.columns, index)
+
+
+class _LazyMarket:
+    """Bounded annual cache backed by partition-pushed parquet reads."""
+
+    def __init__(self, snapshot, cutoff, instruments, fields):
+        self.snapshot = snapshot
+        self.cutoff = cutoff
+        self.instruments = instruments
+        self.fields = fields
+        self.cache: dict[int, dict[date, _DayBars]] = {}
+
+    def get(self, day):
+        year = day.year
+        if year not in self.cache:
+            year_start = date(year, 1, 1)
+            year_end = min(date(year, 12, 31), self.cutoff)
+            raw = self.snapshot.trading(self.cutoff).bars(
+                year_start, year_end, instruments=self.instruments,
+                fields=self.fields,
+            )
+            days = sorted(set(raw["trade_date"]))
+            self.cache[year] = _index_bars(raw, days)
+            # A year boundary may need the prior session. Two annual partitions
+            # remain far below the previous 12-year resident frame.
+            while len(self.cache) > 2:
+                self.cache.pop(next(iter(self.cache)))
+        return self.cache[year].get(day)
 
 
 class _MarketRow:
@@ -247,15 +283,27 @@ class BacktestEngine:
         self._calendar_index = {day: index for index, day in enumerate(calendar)}
         self._calendar = calendar
         self._rule_cache: dict[tuple[Any, ...], Any] = {}
+        self._market_rules = snapshot.table("market_rules", cutoff=end)
         instruments = snapshot.table("instruments")
         instrument_rows = {str(row.instrument_id): row for row in instruments.itertuples(index=False)}
         self._instrument_ids = frozenset(instrument_rows)
-        market_start = bootstrap_day or start
-        raw = snapshot.trading(end).bars(
-            market_start, end, fields=_BAR_FIELDS
+        scopes = [
+            getattr(item.strategy, "market_instruments", None)
+            for item in strategies
+        ]
+        # A prepared strategy may declare the exact instruments it can trade.
+        # Only apply the pushdown when every sleeve supplies a scope; otherwise
+        # preserve the framework's unrestricted legacy behaviour.
+        market_instruments = None
+        if scopes and all(scope is not None for scope in scopes):
+            scoped_codes: set[str] = set()
+            for scope in scopes:
+                if scope is not None:
+                    scoped_codes.update(map(str, scope))
+            market_instruments = sorted(scoped_codes)
+        market = _LazyMarket(
+            snapshot, end, market_instruments, _BAR_FIELDS,
         )
-        market = _index_bars(raw, planning_calendar)
-        del raw
         allocations = (
             dict(self.capital_allocator.allocate(initial_cash))
             if self.capital_allocator is not None
@@ -304,6 +352,23 @@ class BacktestEngine:
             for strategy_id in bootstrap_strategy_ids:
                 schedules[strategy_id].add(bootstrap_day)
         pending: dict[tuple[date, str], list[TargetPortfolio]] = defaultdict(list)
+        valued_codes: set[str] = set()
+        # The causal valuation book is updated only from observed bars. Missing
+        # bars may use it only after the instrument reaches its disposal day.
+        valuation_marks: dict[str, _ValuationMark] = {}
+        delisting_days: dict[str, date] = {}
+        for code, row in instrument_rows.items():
+            raw_date = getattr(row, "delist_date", None)
+            if raw_date is None or pd.isna(raw_date):
+                continue
+            delist_date = raw_date.date() if hasattr(raw_date, "date") else raw_date
+            index = bisect_left(calendar, delist_date)
+            if index < len(calendar):
+                delisting_days[code] = calendar[index]
+        self._delisting_days = delisting_days
+        self._delisted_codes: set[str] = set()
+        self._valuation_marks = valuation_marks
+        self._delisting_migrations: set[str] = set()
         entitlements: dict[tuple[str, str], int] = {}
         frames: dict[str, list[dict[str, Any]]] = defaultdict(list)
         actions = snapshot.table("corporate_actions", cutoff=end)
@@ -342,6 +407,7 @@ class BacktestEngine:
             self._execute_targets(
                 day, "open", pending.pop((day, "open"), []), sleeves, market,
                 instrument_rows, calendar, frames, master, snapshot,
+                valuation_marks,
             )
             if self.execution_config.timing == "same_close" and day_index > 0:
                 previous_day = calendar[day_index - 1]
@@ -354,14 +420,56 @@ class BacktestEngine:
             self._execute_targets(
                 day, "close", pending.pop((day, "close"), []), sleeves, market,
                 instrument_rows, calendar, frames, master, snapshot,
+                valuation_marks,
             )
-            # Deliberately the whole day's cross-section, not just held codes.
-            # Every consumer (`_record_daily`, `_portfolio_view`, `nav`,
-            # `reconcile`) only reads the codes it holds, so restricting this
-            # would be correct today — but it would bake "valuation only needs
-            # holdings" into the engine, and a future consumer would silently
-            # read 0.0 instead of failing. Building it per day is cheap.
-            close_prices = _price_map(market, day, "close")
+            # Strategy contexts and daily accounting only value held names.
+            # Execution reads its own full day slice from `market`, so building
+            # a several-thousand-name dict twice per session is unnecessary.
+            valued_codes.clear()
+            for sleeve in sleeves.values():
+                valued_codes.update(
+                    code for code in sleeve.lots if sleeve.quantity(code)
+                )
+            close_bars = market.get(day)
+            close_prices: dict[str, float] = {}
+            if close_bars is not None:
+                for code in valued_codes:
+                    if code in self._delisted_codes:
+                        continue
+                    bar = close_bars.row(code)
+                    if bar is not None:
+                        # Match `_DayBars.price_map()`'s Python-scalar
+                        # conversion exactly, including floating addition order.
+                        price = bar.close.item()
+                        close_prices[code] = price
+                        valuation_marks[code] = _ValuationMark(
+                            price, day, bool(bar.paused),
+                        )
+            missing_active = sorted(
+                code for code in valued_codes
+                if code not in close_prices
+                and not self._is_delisting_effective(code, day)
+            )
+            if missing_active:
+                raise BacktestError(
+                    f"active held instruments have no bar on {day}: "
+                    f"{missing_active[:10]}"
+                )
+            for code in valued_codes:
+                if code in close_prices:
+                    continue
+                mark = valuation_marks.get(code)
+                if mark is None:
+                    raise BacktestError(
+                        f"cannot value delisted held instrument on {day}: {code}"
+                    )
+                close_prices[code] = mark.price
+            self._record_entitlements(
+                day, action_records, sleeves, master, entitlements
+            )
+            self._process_delistings(
+                day, sleeves, master, close_prices, frames
+            )
             if self.execution_config.timing != "same_close" and day_index + 1 < len(calendar):
                 execution_day = calendar[day_index + 1]
                 phase = "open" if self.execution_config.timing == "next_open" else "close"
@@ -370,9 +478,6 @@ class BacktestEngine:
                     schedules, sleeves, states, previous_targets, pending, frames,
                     snapshot, close_prices, seed,
                 )
-            self._record_entitlements(
-                day, action_records, sleeves, master, entitlements
-            )
             self._record_daily(day, sleeves, master, close_prices, frames)
         materialized = {name: pd.DataFrame(rows) for name, rows in frames.items()}
         for required in (
@@ -391,6 +496,7 @@ class BacktestEngine:
             materialized["nav"], materialized["fills"], initial_cash,
             materialized["positions"],
         )
+        metrics.update(self._delisting_metrics(materialized["positions"]))
         if compute_attribution:
             materialized["attribution"] = attribution_report(
                 materialized["nav"], materialized["fill_allocations"],
@@ -547,16 +653,48 @@ class BacktestEngine:
 
     def _execute_targets(
         self, day, phase, targets, sleeves, market, instrument_rows, calendar,
-        frames, master, snapshot,
+        frames, master, snapshot, valuation_marks,
     ):
         if not targets:
             return
-        prices = _price_map(market, day, "open" if phase == "open" else "close")
+        daily_bars = market.get(day)
+        field = "open" if phase == "open" else "close"
+        required_codes: set[str] = set()
+        for target in targets:
+            sleeve = sleeves[target.strategy_id]
+            liquidation = target.diagnostics.get("liquidate_only_instruments")
+            required_codes.update(
+                map(str, liquidation)
+                if liquidation is not None
+                else set(target.weights) | sleeve.instruments(target.cohort_id)
+            )
+            required_codes.update(sleeve.lots)
+        prices = {}
+        if daily_bars is not None:
+            for code in required_codes:
+                bar = daily_bars.row(code)
+                if bar is not None:
+                    prices[code] = getattr(bar, field).item()
+        valuation_prices = dict(prices)
+        for code in self._delisted_codes:
+            mark = valuation_marks.get(code)
+            if mark is not None:
+                valuation_prices[code] = mark.price
+        for target in targets:
+            sleeve = sleeves[target.strategy_id]
+            for code in sleeve.instruments(target.cohort_id):
+                mark = valuation_marks.get(code)
+                if (
+                    code not in valuation_prices
+                    and mark is not None
+                    and self._is_delisting_effective(code, day)
+                ):
+                    valuation_prices[code] = mark.price
         for target in targets:
             sleeve = sleeves[target.strategy_id]
             missing_held = [
                 code for code in sleeve.instruments(target.cohort_id)
-                if code not in prices
+                if code not in valuation_prices
             ]
             if missing_held:
                 raise BacktestError(
@@ -571,7 +709,7 @@ class BacktestEngine:
         # checked again before any internal transfer.
         for target in targets:
             sleeve = sleeves[target.strategy_id]
-            nav = sleeve.nav(prices)
+            nav = sleeve.nav(valuation_prices)
             liquidation = target.diagnostics.get(
                 "liquidate_only_instruments"
             )
@@ -581,6 +719,8 @@ class BacktestEngine:
                 else set(target.weights) | sleeve.instruments(target.cohort_id)
             )
             for code in sorted(codes):
+                if code in self._delisted_codes:
+                    continue
                 price = prices.get(code)
                 if price is None or price <= 0 or code not in instrument_rows:
                     continue
@@ -605,7 +745,7 @@ class BacktestEngine:
                     )
         for target in targets:
             sleeve = sleeves[target.strategy_id]
-            nav = sleeve.nav(prices)
+            nav = sleeve.nav(valuation_prices)
             liquidation = target.diagnostics.get(
                 "liquidate_only_instruments"
             )
@@ -615,7 +755,10 @@ class BacktestEngine:
                 else set(target.weights) | sleeve.instruments(target.cohort_id)
             )
             for code in sorted(codes):
-                price = prices.get(code)
+                is_frozen = code in self._delisted_codes
+                price = (
+                    valuation_prices.get(code) if is_frozen else prices.get(code)
+                )
                 cohort_suffix = f":{target.cohort_id}" if target.cohort_id else ""
                 demand_id = (
                     f"{day}:{phase}:{target.strategy_id}:{code}{cohort_suffix}"
@@ -623,6 +766,18 @@ class BacktestEngine:
                 if code not in instrument_rows:
                     raise BacktestError(f"target references unknown instrument: {code}")
                 if price is None or price <= 0:
+                    held = sleeve.quantity(code, target.cohort_id)
+                    if self._is_delisting_effective(code, day):
+                        side = "sell" if held else "buy"
+                        frames["demand_residuals"].append({
+                            "demand_id": demand_id, "execution_date": day,
+                            "execution_phase": phase,
+                            "strategy_id": target.strategy_id,
+                            "instrument_id": code, "side": side,
+                            "quantity": held or None,
+                            "reason": "delisted_illiquid",
+                        })
+                        continue
                     frames["demand_residuals"].append({
                         "demand_id": demand_id, "execution_date": day,
                         "execution_phase": phase, "strategy_id": target.strategy_id,
@@ -639,6 +794,25 @@ class BacktestEngine:
                 )
                 current = sleeve.quantity(code, target.cohort_id)
                 difference = desired - current
+                delist_day = self._delisting_days.get(code)
+                if difference > 0 and delist_day is not None and day >= delist_day:
+                    frames["demand_residuals"].append({
+                        "demand_id": demand_id, "execution_date": day,
+                        "execution_phase": phase, "strategy_id": target.strategy_id,
+                        "instrument_id": code, "side": "buy",
+                        "quantity": math.floor(difference / lot) * lot,
+                        "reason": "delisted_illiquid",
+                    })
+                    continue
+                if difference < 0 and is_frozen:
+                    frames["demand_residuals"].append({
+                        "demand_id": demand_id, "execution_date": day,
+                        "execution_phase": phase, "strategy_id": target.strategy_id,
+                        "instrument_id": code, "side": "sell",
+                        "quantity": -difference,
+                        "reason": "delisted_illiquid",
+                    })
+                    continue
                 if difference < 0:
                     requested = -difference
                     quantity = min(
@@ -832,21 +1006,33 @@ class BacktestEngine:
             rule = self._rule_cache[rule_key]
         else:
             try:
-                rule = snapshot.market_rule(*rule_key)
+                rule_day, rule_exchange, rule_asset_type = rule_key
+                rules = self._market_rules
+                current = rules[
+                    (rules["exchange"].astype(str) == rule_exchange)
+                    & (rules["asset_type"].astype(str) == rule_asset_type)
+                    & (rules["effective_from"] <= rule_day)
+                    & (
+                        rules["effective_to"].isna()
+                        | (rules["effective_to"] >= rule_day)
+                    )
+                ]
+                if len(current) != 1:
+                    raise DataContractError("market rule is unavailable")
+                rule = current.iloc[0]
             except DataContractError:
                 rule = None
             self._rule_cache[rule_key] = rule
         fill = self.executor.execute(order, row, asset_type, rule)
         self._validate_fill(order, fill)
         demands = residuals.get((order.instrument_id, order.side), [])
-        demand_by_strategy = {}
-        for demand in demands:
-            if demand.strategy_id in demand_by_strategy:
-                raise BacktestError(
-                    "multiple same-phase cohort demands for one strategy and instrument"
-                )
-            demand_by_strategy[demand.strategy_id] = demand
-        quantities = allocate_fill_quantities(order, fill.filled_quantity, demands)
+        demand_by_key = {
+            (demand.strategy_id, demand.cohort_id, demand.demand_id): demand
+            for demand in demands
+        }
+        if len(demand_by_key) != len(demands):
+            raise BacktestError("duplicate same-phase cohort demand")
+        quantities = allocate_fill_demands(order, fill.filled_quantity, demands)
         if order.side == "buy":
             # Resolved once per order: the rule and asset type are loop
             # invariants, and `_cost_rule` was previously re-resolved on every
@@ -854,8 +1040,9 @@ class BacktestEngine:
             commission_bps, minimum_commission, _, buy_tax_bps, transfer = (
                 self._cost_rule(rule, asset_type)
             )
-            for strategy_id in list(quantities):
-                quantity = quantities[strategy_id]
+            for demand_key in list(quantities):
+                strategy_id = demand_key[0]
+                quantity = quantities[demand_key]
                 lot = order.lot_size
                 while quantity > 0:
                     notional = quantity * fill.price
@@ -870,7 +1057,7 @@ class BacktestEngine:
                     ):
                         break
                     quantity -= lot
-                quantities[strategy_id] = quantity
+                quantities[demand_key] = quantity
             quantities = {key: value for key, value in quantities.items() if value > 0}
         actual = sum(quantities.values())
         actual_notional = actual * fill.price
@@ -886,13 +1073,9 @@ class BacktestEngine:
         ) if actual else 0.0
         tax_rate = sell_tax_bps if order.side == "sell" else buy_tax_bps
         tax = actual_notional * tax_rate / 10000 if actual else 0.0
-        allocations = cost_allocations(
+        allocations = cost_demand_allocations(
             order, quantities, fill.price, commission, tax,
             fill.slippage_bps + fill.impact_bps,
-            {
-                strategy_id: demand_by_strategy[strategy_id].cohort_id
-                for strategy_id in quantities
-            },
         )
         for allocation in allocations:
             sleeve = sleeves[allocation.strategy_id]
@@ -959,11 +1142,14 @@ class BacktestEngine:
                     order.instrument_id, actual, order.execution_date,
                     sellable_date, fill.price,
                 ))
-        allocated_by_strategy = {
-            allocation.strategy_id: allocation.quantity for allocation in allocations
+        allocated_by_key = {
+            (allocation.strategy_id, allocation.cohort_id): allocation.quantity
+            for allocation in allocations
         }
         for demand in demands:
-            unfilled = demand.quantity - allocated_by_strategy.get(demand.strategy_id, 0)
+            unfilled = demand.quantity - allocated_by_key.get(
+                (demand.strategy_id, demand.cohort_id), 0,
+            )
             if unfilled:
                 frames["demand_residuals"].append({
                     "demand_id": demand.demand_id,
@@ -1105,13 +1291,42 @@ class BacktestEngine:
                 f"target contains instruments outside the snapshot: {unknown[:10]}"
             )
 
-    @staticmethod
-    def _portfolio_view(sleeve, prices, day):
-        positions = tuple(
-            PositionView(code, sleeve.quantity(code), sleeve.sellable_quantity(code, day), prices.get(code, 0.0))
-            for code in sorted(sleeve.lots) if sleeve.quantity(code)
-        )
-        return PortfolioView(sleeve.nav(prices), sleeve.cash, positions)
+    def _portfolio_view(self, sleeve, prices, day):
+        positions = []
+        for code in sorted(sleeve.lots):
+            quantity = sleeve.quantity(code)
+            if not quantity:
+                continue
+            if code not in prices:
+                raise BacktestError(f"cannot value held instrument on {day}: {code}")
+            cohort_quantities: dict[str, int] = {}
+            cohort_sellable: dict[str, int] = {}
+            for lot in sleeve.lots[code]:
+                if lot.quantity <= 0 or lot.cohort_id is None:
+                    continue
+                cohort_quantities[lot.cohort_id] = (
+                    cohort_quantities.get(lot.cohort_id, 0) + lot.quantity
+                )
+                if lot.sellable_date <= day:
+                    cohort_sellable[lot.cohort_id] = (
+                        cohort_sellable.get(lot.cohort_id, 0) + lot.quantity
+                    )
+            if code in self._delisted_codes:
+                cohort_sellable = {}
+            audit = self._valuation_audit(code, day, prices[code])
+            positions.append(PositionView(
+                code,
+                quantity,
+                0 if code in self._delisted_codes else sleeve.sellable_quantity(code, day),
+                prices[code],
+                cohort_quantities,
+                cohort_sellable,
+                audit["position_status"],
+                audit["valuation_source"],
+                audit["last_observed_date"],
+                audit["stale_sessions"],
+            ))
+        return PortfolioView(sleeve.nav(prices), sleeve.cash, tuple(positions))
 
     def _sellable_date(self, day, delay, calendar):
         # `calendar.index(day)` is a linear scan and this runs on every buy fill
@@ -1207,8 +1422,111 @@ class BacktestEngine:
                         })
         master.reconcile(sleeves, {})
 
-    @staticmethod
-    def _record_daily(day, sleeves, master, prices, frames):
+    def _is_delisting_effective(self, code, day):
+        delist_day = self._delisting_days.get(code)
+        return delist_day is not None and day >= delist_day
+
+    def _valuation_audit(self, code, day, fallback_price=None):
+        mark = self._valuation_marks.get(code)
+        if mark is None:
+            if fallback_price is None:
+                raise BacktestError(
+                    f"valuation book has no causal mark for {code} on {day}"
+                )
+            mark = _ValuationMark(float(fallback_price), day)
+        observed_index = bisect_left(self._calendar, mark.observed_date)
+        day_index = self._calendar_index.get(day, bisect_left(self._calendar, day))
+        stale_sessions = max(0, day_index - observed_index)
+        if code in self._delisted_codes:
+            status = "delisted_illiquid"
+        elif mark.paused and mark.observed_date == day:
+            status = "suspended"
+        else:
+            status = "active"
+        return {
+            "position_status": status,
+            "valuation_source": (
+                "market_close" if mark.observed_date == day else "last_observed"
+            ),
+            "last_observed_date": mark.observed_date,
+            "stale_sessions": stale_sessions,
+        }
+
+    def _process_delistings(self, day, sleeves, master, prices, frames):
+        due_codes = sorted(
+            code for code, disposal_day in self._delisting_days.items()
+            if disposal_day == day and code not in self._delisted_codes
+        )
+        if not due_codes:
+            return
+        policy = self.execution_config.delisting_policy
+        recovery = self.execution_config.delisting_recovery_rate
+        accounts = {**sleeves, "__master__": master}
+        for code in due_codes:
+            held_quantity = sum(sleeve.quantity(code) for sleeve in sleeves.values())
+            if held_quantity:
+                self._delisting_migrations.add(code)
+                if code not in prices:
+                    raise BacktestError(
+                        f"delisted held instrument has no causal mark on {day}: {code}"
+                    )
+            reference_price = prices.get(code)
+            for account_id, account in accounts.items():
+                quantity = account.quantity(code)
+                if not quantity:
+                    continue
+                assert reference_price is not None
+                carrying_value = quantity * reference_price
+                proceeds = (
+                    carrying_value * recovery
+                    if policy == "cash_settle_last_close" else 0.0
+                )
+                pnl = (
+                    proceeds - carrying_value
+                    if policy in {"cash_settle_last_close", "write_off_zero"}
+                    else 0.0
+                )
+                if policy != "carry_last_mark":
+                    removed = account.remove_any(code, quantity)
+                    if removed != quantity:
+                        raise BacktestError("delisting disposal did not remove all lots")
+                    account.cash += proceeds
+                event_id = f"delisting:{code}:{day}:{account_id}"
+                destination = (
+                    "master_corporate_actions"
+                    if account_id == "__master__" else "corporate_actions"
+                )
+                frames[destination].append({
+                    "date": day,
+                    "strategy_id": account_id,
+                    "event_id": event_id,
+                    "instrument_id": code,
+                    "type": "delisting_disposal",
+                    "policy": policy,
+                    "quantity": quantity,
+                    "reference_price": reference_price,
+                    "recovery_rate": recovery if policy == "cash_settle_last_close" else None,
+                    "amount": proceeds,
+                    "pnl": pnl,
+                })
+                if policy == "cash_settle_last_close":
+                    frames["cashflows"].append({
+                        "event_id": f"{event_id}:settlement",
+                        "date": day,
+                        "account_id": account_id,
+                        "flow_type": "delisting_cash_settlement",
+                        "amount": proceeds,
+                        "instrument_id": code,
+                        "upstream_event_id": event_id,
+                    })
+            self._delisted_codes.add(code)
+        master.reconcile(sleeves, prices)
+        frames["reconciliations"].append({
+            "date": day, "phase": "close", "event": "after_delisting",
+            "status": "passed",
+        })
+
+    def _record_daily(self, day, sleeves, master, prices, frames):
         for strategy_id, sleeve in sleeves.items():
             nav = sleeve.nav(prices)
             if sleeve.cash < -1e-7 or nav < -1e-7:
@@ -1220,11 +1538,17 @@ class BacktestEngine:
             for code in sorted(sleeve.lots):
                 quantity = sleeve.quantity(code)
                 if quantity:
-                    price = prices.get(code, 0.0)
+                    if code not in prices:
+                        raise BacktestError(
+                            f"cannot value held instrument on {day}: {code}"
+                        )
+                    price = prices[code]
+                    audit = self._valuation_audit(code, day, price)
                     frames["positions"].append({
                         "date": day, "strategy_id": strategy_id,
                         "instrument_id": code, "quantity": quantity,
                         "last_price": price, "market_value": quantity * price,
+                        **audit,
                     })
                 for lot in sleeve.lots[code]:
                     if lot.quantity:
@@ -1246,16 +1570,46 @@ class BacktestEngine:
         for code in sorted(master.lots):
             quantity = master.quantity(code)
             if quantity:
-                price = prices.get(code, 0.0)
+                if code not in prices:
+                    raise BacktestError(
+                        f"cannot value master held instrument on {day}: {code}"
+                    )
+                price = prices[code]
+                audit = self._valuation_audit(code, day, price)
                 frames["master_positions"].append({
                     "date": day, "account_id": "__master__",
                     "instrument_id": code, "quantity": quantity,
                     "last_price": price, "market_value": quantity * price,
+                    **audit,
                 })
         frames["reconciliations"].append({
             "date": day, "phase": "close", "event": "daily_close",
             "status": "passed",
         })
+
+    def _delisting_metrics(self, positions):
+        metrics = {
+            "delisting_policy": self.execution_config.delisting_policy,
+            "delisting_recovery_rate": self.execution_config.delisting_recovery_rate,
+            "delisted_migrated_instruments": len(self._delisting_migrations),
+            "terminal_delisted_frozen_positions": 0,
+            "terminal_delisted_frozen_market_value": 0.0,
+            "maximum_stale_sessions": 0,
+        }
+        if positions.empty:
+            return metrics
+        metrics["maximum_stale_sessions"] = int(positions["stale_sessions"].max())
+        terminal = positions[positions["date"] == positions["date"].max()]
+        frozen = terminal[
+            terminal["position_status"] == "delisted_illiquid"
+        ]
+        metrics["terminal_delisted_frozen_positions"] = int(
+            frozen["instrument_id"].nunique()
+        )
+        metrics["terminal_delisted_frozen_market_value"] = float(
+            frozen["market_value"].sum()
+        )
+        return metrics
 
     @staticmethod
     def _validate_bindings(strategies):

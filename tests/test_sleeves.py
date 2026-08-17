@@ -3,11 +3,32 @@ from __future__ import annotations
 import unittest
 from datetime import date
 
-from zyquant.backtest.types import SleeveDemand
-from zyquant.portfolio.sleeve import allocate_fill_quantities, net_sleeve_demands
+from zyquant.backtest.types import MasterOrder, SleeveDemand
+from zyquant.portfolio.sleeve import (
+    allocate_fill_demands, allocate_fill_quantities, net_sleeve_demands,
+)
 
 
 class SleeveTests(unittest.TestCase):
+    def test_fill_allocation_keeps_same_strategy_cohorts_separate(self):
+        order = MasterOrder(
+            "order", date(2024, 1, 2), "close", "X", "sell", 300,
+            10.0, 100,
+        )
+        demands = [
+            SleeveDemand(
+                "strategy", "X", "sell", 100, 10.0, 100,
+                "demand-a", "close", 0, "cohort-a",
+            ),
+            SleeveDemand(
+                "strategy", "X", "sell", 200, 10.0, 100,
+                "demand-b", "close", 0, "cohort-b",
+            ),
+        ]
+        allocation = allocate_fill_demands(order, 300, demands)
+        self.assertEqual(allocation[("strategy", "cohort-a", "demand-a")], 100)
+        self.assertEqual(allocation[("strategy", "cohort-b", "demand-b")], 200)
+
     def test_internal_cross_and_deterministic_allocation(self):
         day = date(2025, 1, 2)
         demands = [
@@ -28,4 +49,3 @@ class SleeveTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

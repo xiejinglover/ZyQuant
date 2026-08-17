@@ -28,6 +28,12 @@ class PositionView:
     quantity: int
     sellable_quantity: int
     last_price: float
+    cohort_quantities: Mapping[str, int] = field(default_factory=dict)
+    cohort_sellable_quantities: Mapping[str, int] = field(default_factory=dict)
+    position_status: str = "active"
+    valuation_source: str = "market_close"
+    last_observed_date: date | None = None
+    stale_sessions: int = 0
 
 
 @dataclass(frozen=True)

@@ -39,7 +39,8 @@ LEDGER_COLUMNS: Mapping[str, tuple[str, ...]] = {
     ),
     "positions": (
         "date", "strategy_id", "instrument_id", "quantity",
-        "last_price", "market_value",
+        "last_price", "market_value", "position_status", "valuation_source",
+        "last_observed_date", "stale_sessions",
     ),
     "position_lots": (
         "date", "strategy_id", "instrument_id", "cohort_id", "quantity",
@@ -47,7 +48,8 @@ LEDGER_COLUMNS: Mapping[str, tuple[str, ...]] = {
     ),
     "master_positions": (
         "date", "account_id", "instrument_id", "quantity",
-        "last_price", "market_value",
+        "last_price", "market_value", "position_status", "valuation_source",
+        "last_observed_date", "stale_sessions",
     ),
     "nav": ("date", "strategy_id", "cash", "receivables", "nav"),
     "master_nav": ("date", "account_id", "cash", "receivables", "nav"),

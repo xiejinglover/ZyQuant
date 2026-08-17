@@ -33,6 +33,20 @@ zyq runs list --database runs/experiments.sqlite
 账本、基础绩效和报告；需要归因时，可在回测完成后基于已落盘账本单独生成，
 无需重新执行策略和撮合。
 
+## 退市持仓假设
+
+`execution.delisting_policy` 控制持仓在回测日历首个不早于
+`delist_date` 的交易日如何处置：
+
+- `carry_last_mark`（默认）：保留股份、冻结交易，按最后因果收盘价估值；
+- `write_off_zero`：注销全部 lot，不增加现金，将账面价值确认为退市损失；
+- `cash_settle_last_close`：按最后收盘价与
+  `delisting_recovery_rate`（`0` 至 `1`）合成现金结算。
+
+三种模式都是回测假设，不代表退市末价可在现实中兑付。框架不接入
+退市板块行情；正常停牌必须由 `paused: true` bar 表示，未退市持仓
+完全缺 bar 仍视为数据错误。
+
 因子缓存默认使用 `factor.cache_policy: compute`：命中即读、缺失时计算并原子
 发布。正式实验应显式改为 `require`，此时缓存缺失会在因子消费阶段立即失败且
 不产生任何缓存文件。策略可通过 `FactorEngine.load_view(..., dates=...)` 从

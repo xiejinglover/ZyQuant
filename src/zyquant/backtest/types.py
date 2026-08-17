@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -71,7 +72,11 @@ class SleeveAccount:
             taken = min(lot.quantity, remaining)
             lot.quantity -= taken
             remaining -= taken
-        self.lots[instrument_id] = [item for item in lots if item.quantity > 0]
+        remaining_lots = [item for item in lots if item.quantity > 0]
+        if remaining_lots:
+            self.lots[instrument_id] = remaining_lots
+        else:
+            self.lots.pop(instrument_id, None)
         return quantity - remaining
 
     def remove_any(self, instrument_id: str, quantity: int) -> int:
@@ -83,7 +88,11 @@ class SleeveAccount:
             taken = min(lot.quantity, remaining)
             lot.quantity -= taken
             remaining -= taken
-        self.lots[instrument_id] = [item for item in lots if item.quantity > 0]
+        remaining_lots = [item for item in lots if item.quantity > 0]
+        if remaining_lots:
+            self.lots[instrument_id] = remaining_lots
+        else:
+            self.lots.pop(instrument_id, None)
         return quantity - remaining
 
     def adjust_shares(
@@ -119,10 +128,14 @@ class SleeveAccount:
                 ))
             else:
                 source.quantity -= quantity
-        self.lots[instrument_id] = [
+        remaining_lots = [
             item for item in self.lots.get(instrument_id, ())
             if item.quantity > 0
         ]
+        if remaining_lots:
+            self.lots[instrument_id] = remaining_lots
+        else:
+            self.lots.pop(instrument_id, None)
         return delta
 
 
@@ -134,8 +147,10 @@ class MasterAccount(SleeveAccount):
         prices: Mapping[str, float],
         tolerance: float = 1e-7,
     ) -> None:
-        sleeve_cash = sum(item.cash for item in sleeves.values())
-        if abs(self.cash - sleeve_cash) > tolerance:
+        sleeve_cash = math.fsum(item.cash for item in sleeves.values())
+        if not math.isclose(
+            self.cash, sleeve_cash, rel_tol=1e-13, abs_tol=tolerance
+        ):
             raise AccountingError(
                 f"master/sleeve cash mismatch: {self.cash} vs {sleeve_cash}"
             )
@@ -150,16 +165,22 @@ class MasterAccount(SleeveAccount):
                     f"master/sleeve position mismatch for {code}: "
                     f"{master_quantity} vs {sleeve_quantity}"
                 )
-        master_receivables = sum(self.receivables.values())
-        sleeve_receivables = sum(
-            sum(item.receivables.values()) for item in sleeves.values()
+        master_receivables = math.fsum(self.receivables.values())
+        sleeve_receivables = math.fsum(
+            math.fsum(item.receivables.values()) for item in sleeves.values()
         )
-        if abs(master_receivables - sleeve_receivables) > tolerance:
+        if not math.isclose(
+            master_receivables, sleeve_receivables,
+            rel_tol=1e-13, abs_tol=tolerance,
+        ):
             raise AccountingError("master/sleeve receivables mismatch")
-        sleeve_nav = sum(item.nav(prices) for item in sleeves.values())
-        if abs(self.nav(prices) - sleeve_nav) > tolerance:
+        sleeve_nav = math.fsum(item.nav(prices) for item in sleeves.values())
+        master_nav = self.nav(prices)
+        if not math.isclose(
+            master_nav, sleeve_nav, rel_tol=1e-13, abs_tol=tolerance
+        ):
             raise AccountingError(
-                f"master/sleeve NAV mismatch: {self.nav(prices)} vs {sleeve_nav}"
+                f"master/sleeve NAV mismatch: {master_nav} vs {sleeve_nav}"
             )
 
 

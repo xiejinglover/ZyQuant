@@ -28,6 +28,14 @@ def attribution_report(
         ]
         for item in receivables.itertuples(index=False):
             action_by_day[item.date] = action_by_day.get(item.date, 0.0) + float(item.amount)
+        if "pnl" in corporate_actions.columns:
+            delisting = corporate_actions[
+                corporate_actions["type"] == "delisting_disposal"
+            ].dropna(subset=["pnl"])
+            for item in delisting.itertuples(index=False):
+                action_by_day[item.date] = (
+                    action_by_day.get(item.date, 0.0) + float(item.pnl)
+                )
 
     rows: list[dict] = []
     for record in daily.dropna(subset=["account_pnl"]).itertuples(index=False):

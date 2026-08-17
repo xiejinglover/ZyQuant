@@ -1,6 +1,6 @@
 # ZyQuant v1 标准账本契约
 
-标准账本 schema 版本为 `1.0`。每条订单和现金事件都包含稳定事件 ID、日期、
+标准账本 schema 版本为 `1.1`。每条订单和现金事件都包含稳定事件 ID、日期、
 账户或策略、证券以及上游事件引用。
 
 主要产物：
@@ -14,6 +14,12 @@
 - `corporate_actions`：登记权益、应收、份额调整和到账；
 - `reconciliations`：逐事件及收盘守恒检查；
 - `attribution`：价格、公司行动、现金、费用、滑点和执行残差。
+
+`positions` 与 `master_positions` 在原有核心列后追加
+`position_status`、`valuation_source`、`last_observed_date` 和
+`stale_sessions`。旧读取方可继续只消费原列。退市处置使用确定性
+`delisting_disposal` 公司行动记录；现金结算另写入 `cashflows`，
+折价或归零损益计入归因的 `corporate_action` 分量。
 
 每个执行事件和每日收盘后必须满足：
 
