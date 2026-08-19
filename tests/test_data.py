@@ -4,14 +4,41 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import pandas as pd
 
 from zyquant.core.exceptions import DataContractError, FutureDataError
-from zyquant.data import AdjustmentProcessor, ParquetDataProvider, SnapshotPublisher
+from zyquant.data import (
+    AdjustmentProcessor, DirectoryDataAdapter, ParquetDataProvider,
+    SnapshotPublisher,
+)
 
 from tests.support import CODE_A, canonical_tables
 
 
 class DataTests(unittest.TestCase):
+    @staticmethod
+    def _money_flow(days):
+        return pd.DataFrame([
+            {
+                "trade_date": days[0],
+                "instrument_id": CODE_A,
+                "inflow": 100.0,
+                "outflow": 40.0,
+                "net_inflow": 60.0,
+                "available_at": days[0],
+                "source_record_id": "flow-1",
+            },
+            {
+                "trade_date": days[1],
+                "instrument_id": CODE_A,
+                "inflow": None,
+                "outflow": 0.0,
+                "net_inflow": None,
+                "available_at": days[3],
+                "source_record_id": "flow-2",
+            },
+        ])
+
     def test_publish_materializes_post_adjusted_once(self):
         with tempfile.TemporaryDirectory() as temporary:
             tables, days = canonical_tables()
@@ -115,6 +142,99 @@ class DataTests(unittest.TestCase):
         )
         self.assertEqual(result.diagnostics.factor_source, "corporate_action")
         self.assertEqual(result.diagnostics.vendor_factors["status"], "not_checked")
+
+    def test_money_flow_is_optional_manifested_and_pit_filtered(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base, days = canonical_tables()
+            without_flow = SnapshotPublisher(temporary).publish(
+                "without-flow", base
+            )
+            tables = dict(base)
+            tables["daily_money_flow"] = self._money_flow(days)
+            with_flow = SnapshotPublisher(temporary).publish(
+                "with-flow", tables
+            )
+
+            self.assertNotEqual(
+                without_flow.metadata.fingerprint,
+                with_flow.metadata.fingerprint,
+            )
+            with self.assertRaisesRegex(
+                DataContractError, "manifest does not contain"
+            ):
+                without_flow.table(
+                    "daily_money_flow", cutoff=days[-1]
+                )
+            self.assertIn(
+                "daily_money_flow",
+                {item["name"] for item in with_flow.manifest["tables"]},
+            )
+            self.assertIn(
+                "daily_money_flow", with_flow.manifest["capabilities"]
+            )
+            self.assertIn(
+                "daily_money_flow", with_flow.manifest["lineage"]
+            )
+
+            early = with_flow.table(
+                "daily_money_flow",
+                start=days[0],
+                end=days[1],
+                cutoff=days[2],
+            )
+            self.assertEqual(list(early["source_record_id"]), ["flow-1"])
+            visible = with_flow.table(
+                "daily_money_flow",
+                start=days[0],
+                end=days[1],
+                cutoff=days[3],
+            )
+            self.assertEqual(len(visible), 2)
+            self.assertTrue(pd.isna(visible.iloc[1]["inflow"]))
+            self.assertEqual(visible.iloc[1]["outflow"], 0.0)
+
+    def test_money_flow_requires_cutoff_and_known_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tables, days = canonical_tables()
+            tables["daily_money_flow"] = self._money_flow(days)
+            snapshot = SnapshotPublisher(temporary).publish("flow", tables)
+            with self.assertRaises(FutureDataError):
+                snapshot.table("daily_money_flow")
+            with self.assertRaises(DataContractError):
+                snapshot.table(
+                    "daily_money_flow",
+                    end=days[0],
+                    cutoff=days[0],
+                    fields=["not_a_field"],
+                )
+
+    def test_money_flow_reconciliation_and_unknown_tables_fail_fast(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tables, days = canonical_tables()
+            bad = self._money_flow(days).iloc[[0]].copy()
+            bad.loc[:, "net_inflow"] = 59.0
+            tables["daily_money_flow"] = bad
+            with self.assertRaisesRegex(
+                DataContractError, "does not reconcile"
+            ):
+                SnapshotPublisher(temporary).publish("bad-flow", tables)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            tables, _ = canonical_tables()
+            tables["unregistered"] = pd.DataFrame({"value": [1]})
+            with self.assertRaisesRegex(
+                DataContractError, "unsupported canonical"
+            ):
+                SnapshotPublisher(temporary).publish("unknown", tables)
+
+    def test_directory_adapter_loads_optional_money_flow(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tables, days = canonical_tables()
+            tables["daily_money_flow"] = self._money_flow(days)
+            for name, frame in tables.items():
+                frame.to_parquet(f"{temporary}/{name}.parquet", index=False)
+            batch = DirectoryDataAdapter(temporary).ingest()
+            self.assertIn("daily_money_flow", batch.tables)
 
 
 if __name__ == "__main__":

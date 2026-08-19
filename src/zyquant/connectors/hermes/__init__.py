@@ -24,6 +24,19 @@ def _date(value: Any, default: date) -> date:
     return value if isinstance(value, date) else date.fromisoformat(str(value))
 
 
+def _boolean(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise DataContractError(f"invalid boolean value: {value!r}")
+
+
 def request_from_mapping(
     value: Mapping[str, Any] | None,
 ) -> HermesAcquisitionRequest:
@@ -46,6 +59,7 @@ def request_from_mapping(
         exchanges=tuple(payload.get("exchanges", ("XSHG", "XSHE", "XBEI"))),
         root=Path(payload.get("root", "data")),
         limits=HermesResourceLimits(**limits),
+        include_money_flow=_boolean(payload.get("include_money_flow")),
     )
 
 

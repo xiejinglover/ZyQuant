@@ -21,6 +21,11 @@ from zyquant.core.hashing import canonical_json, hash_file, hash_payload
 
 
 HERMES_SOURCE_TABLES = (
+    # Keep strategy-critical enrichment tables first so a fresh acquisition
+    # validates their schema and coverage before downloading the large market
+    # history. Ordering does not change chunk identity or resume semantics.
+    "fdmt_main_data_q_pit",
+    "fdmt_md_n_ttmp",
     "md_security",
     "md_trade_cal",
     "mkt_equd",
@@ -43,6 +48,7 @@ HERMES_SOURCE_TABLES = (
     "vw_fdmt_is_new",
     "vw_fdmt_cf_new",
 )
+OPTIONAL_HERMES_SOURCE_TABLES = ("mkt_equ_mf_new",)
 MONTHLY_TABLES = {
     "mkt_equd": "TRADE_DATE",
     "mkt_equd_adj_af": "TRADE_DATE",
@@ -50,11 +56,23 @@ MONTHLY_TABLES = {
     "mkt_equd_eval": "TRADE_DATE",
     "mkt_equd_eval_new": "TRADE_DATE",
     "mkt_div_yield": "TRADE_DATE",
+    "mkt_equ_mf_new": "TRADE_DATE",
 }
 FINANCIAL_TABLES = {
     "vw_fdmt_bs_new",
     "vw_fdmt_is_new",
     "vw_fdmt_cf_new",
+    "fdmt_main_data_q_pit",
+    "fdmt_md_n_ttmp",
+}
+STATEMENT_FINANCIAL_TABLES = {
+    "vw_fdmt_bs_new",
+    "vw_fdmt_is_new",
+    "vw_fdmt_cf_new",
+}
+PUBLISHED_FINANCIAL_TABLES = {
+    "fdmt_main_data_q_pit",
+    "fdmt_md_n_ttmp",
 }
 DIRECT_EXCHANGE_TABLES = {
     "md_security",
@@ -66,7 +84,7 @@ DIRECT_EXCHANGE_TABLES = {
     "equ_div_pit",
     "equ_splits",
     "equ_allot",
-    *FINANCIAL_TABLES,
+    *STATEMENT_FINANCIAL_TABLES,
 }
 SECURITY_ID_TABLES = {
     "mkt_equd",
@@ -81,6 +99,7 @@ SECURITY_ID_TABLES = {
     "mkt_equd_eval_new",
     "mkt_div_yield",
     "equ_inst_sstate",
+    "mkt_equ_mf_new",
 }
 DATE_FILTERS = {
     "md_security": "COALESCE(DELIST_DATE, %s) >= %s AND LIST_DATE <= %s",
@@ -170,6 +189,7 @@ class HermesAcquisitionRequest:
     exchanges: tuple[str, ...] = ("XSHG", "XSHE", "XBEI")
     root: Path = Path("data")
     limits: HermesResourceLimits = HermesResourceLimits()
+    include_money_flow: bool = False
 
     def __post_init__(self) -> None:
         if self.start_date > self.end_date:
@@ -183,6 +203,11 @@ class HermesAcquisitionRequest:
     @property
     def job_root(self) -> Path:
         return self.root.expanduser().resolve() / "acquisitions" / self.job_id
+
+    @property
+    def source_tables(self) -> tuple[str, ...]:
+        optional = OPTIONAL_HERMES_SOURCE_TABLES if self.include_money_flow else ()
+        return HERMES_SOURCE_TABLES + optional
 
 
 @dataclass(frozen=True)
@@ -545,7 +570,7 @@ class HermesExtractionPlanner:
 
     def plan(self, party_groups: Sequence[Sequence[int]]) -> list[ExtractionChunk]:
         chunks: list[ExtractionChunk] = []
-        for table in HERMES_SOURCE_TABLES:
+        for table in self.request.source_tables:
             if table in MONTHLY_TABLES:
                 chunks.extend(self._monthly(table, MONTHLY_TABLES[table]))
             elif table in FINANCIAL_TABLES:
@@ -587,7 +612,7 @@ class HermesExtractionPlanner:
                 self.request.end_date,
                 self.request.start_date,
             ])
-        if table in FINANCIAL_TABLES:
+        if table in STATEMENT_FINANCIAL_TABLES:
             predicates.append("END_DATE_REP >= %s")
             parameters.append(self.request.financial_warmup_start)
             predicates.append("ACT_PUBTIME < %s")
@@ -596,6 +621,11 @@ class HermesExtractionPlanner:
                     self.request.end_date, datetime.max.time()
                 )
             )
+        if table in PUBLISHED_FINANCIAL_TABLES:
+            predicates.append("END_DATE >= %s")
+            parameters.append(self.request.financial_warmup_start)
+            predicates.append("PUBLISH_DATE <= %s")
+            parameters.append(self.request.end_date)
         if table in {"equ_shares_change", "equ_free_shares", "md_inst_type"}:
             predicates.append(
                 "EXISTS (SELECT 1 FROM md_security s "
@@ -682,10 +712,15 @@ class HermesExtractionPlanner:
             predicates.append(f"PARTY_ID IN ({placeholders})")
             parameters.extend(party_ids)
             partition = f"group-{number:05d}"
+            order = (
+                "PARTY_ID, END_DATE_REP, ACT_PUBTIME, ID"
+                if table in STATEMENT_FINANCIAL_TABLES
+                else "PARTY_ID, END_DATE, PUBLISH_DATE, ID"
+            )
             sql = (
                 f"SELECT * FROM `{table}` WHERE "
                 + " AND ".join(predicates)
-                + " ORDER BY PARTY_ID, END_DATE_REP, ACT_PUBTIME, ID"
+                + f" ORDER BY {order}"
             )
             output.append(ExtractionChunk(
                 f"{table}:{partition}",
@@ -726,8 +761,8 @@ class HermesDataAdapter:
         state = AcquisitionState(root / "state.sqlite")
         try:
             inventory = self.client.schema_inventory()
-            self._validate_inventory(inventory)
-            arrow_schemas = self._arrow_schemas(inventory)
+            self._validate_inventory(inventory, request.source_tables)
+            arrow_schemas = self._arrow_schemas(inventory, request.source_tables)
             schema_hash = hash_payload(inventory)
             inventory_path = root / "source_schema.json"
             if inventory_path.exists():
@@ -831,9 +866,12 @@ class HermesDataAdapter:
         return values
 
     @staticmethod
-    def _validate_inventory(inventory: Sequence[Mapping[str, Any]]) -> None:
+    def _validate_inventory(
+        inventory: Sequence[Mapping[str, Any]],
+        required_tables: Sequence[str] = HERMES_SOURCE_TABLES,
+    ) -> None:
         present = {str(row["TABLE_NAME"]) for row in inventory}
-        missing = set(HERMES_SOURCE_TABLES) - present
+        missing = set(required_tables) - present
         if missing:
             raise DataContractError(
                 f"Hermes is missing required source tables: {sorted(missing)}"
@@ -940,6 +978,7 @@ class HermesDataAdapter:
     @staticmethod
     def _arrow_schemas(
         inventory: Sequence[Mapping[str, Any]],
+        source_tables: Sequence[str] = HERMES_SOURCE_TABLES,
     ) -> dict[str, pa.Schema]:
         type_map = {
             "bigint": pa.int64(),
@@ -948,6 +987,10 @@ class HermesDataAdapter:
             "mediumint": pa.int64(),
             "smallint": pa.int64(),
             "tinyint": pa.int64(),
+            # PyMySQL returns BIT columns as raw bytes (for example b"\x01"),
+            # not Python bools. Preserve the source bytes; normalizers that
+            # need the flag can decode it explicitly.
+            "bit": pa.binary(),
             "decimal": pa.float64(),
             "numeric": pa.float64(),
             "double": pa.float64(),
@@ -968,7 +1011,7 @@ class HermesDataAdapter:
             "varbinary": pa.binary(),
         }
         fields: dict[str, list[pa.Field]] = {
-            table: [] for table in HERMES_SOURCE_TABLES
+            table: [] for table in source_tables
         }
         for row in inventory:
             table = str(row["TABLE_NAME"])

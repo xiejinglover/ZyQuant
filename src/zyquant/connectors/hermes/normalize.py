@@ -19,7 +19,9 @@ from zyquant.core.exceptions import DataContractError
 from zyquant.core.hashing import hash_file, hash_payload
 from zyquant.core.versioning import SNAPSHOT_SCHEMA_VERSION
 
-from zyquant.data.contracts import FIELD_SPECS, FINANCIAL_TABLES
+from zyquant.data.contracts import (
+    FIELD_SPECS, FINANCIAL_TABLES, REQUIRED_COLUMNS,
+)
 from zyquant.data.financial import (
     FUNDAMENTAL_CALCULATION_VERSION,
     ITEM_CATALOG_VERSION,
@@ -34,6 +36,29 @@ FINANCIAL_SOURCE_MAP = {
     "vw_fdmt_bs_new": "balance",
     "vw_fdmt_is_new": "income",
     "vw_fdmt_cf_new": "cash_flow",
+}
+HERMES_DIRECT_METRICS = {
+    "fdmt_main_data_q_pit": {
+        "ROE": ("hermes_roe_q_pct", "single_quarter", "percent", 1.0),
+        "ROE_CUT": (
+            "hermes_inc_return_q_pct", "single_quarter", "percent", 1.0,
+        ),
+        "T_REVENUE_YOY": (
+            "hermes_total_revenue_yoy_q_pct", "single_quarter", "percent", 1.0,
+        ),
+        "NI_YOY": (
+            "hermes_net_profit_yoy_q_pct", "single_quarter", "percent", 1.0,
+        ),
+    },
+    "fdmt_md_n_ttmp": {
+        "EPS": ("hermes_eps_ttm", "ttm", "CNY/share", 1.0),
+        "N_CF_OPA_NIA": (
+            # Hermes stores this percentage-style (90 means 0.90), while the
+            # formula fallback is a dimensionless ratio. Normalize before the
+            # two sources are combined cross-sectionally.
+            "hermes_nocf_coverage_ttm", "ttm", "ratio", 0.01,
+        ),
+    },
 }
 FINANCIAL_ITEM_MAP = {
     "T_ASSETS": "total_assets",
@@ -62,6 +87,29 @@ FINANCIAL_METADATA = {
     "FISCAL_PERIOD", "MERGED_FLAG", "ACCOUTING_STANDARDS",
     "CURRENCY_CD", "INDUSTRY_CATEGORY", "UPDATE_TIME",
 }
+MONEY_FLOW_SOURCE_FIELDS = {
+    "INFLOW": "inflow",
+    "OUTFLOW": "outflow",
+    "NET_FLOW": "net_inflow",
+    "INFLOW_S": "inflow_s",
+    "INFLOW_M": "inflow_m",
+    "INFLOW_L": "inflow_l",
+    "INFLOW_XL": "inflow_xl",
+    "OUTFLOW_S": "outflow_s",
+    "OUTFLOW_M": "outflow_m",
+    "OUTFLOW_L": "outflow_l",
+    "OUTFLOW_XL": "outflow_xl",
+    "NET_FLOW_S": "net_inflow_s",
+    "NET_FLOW_M": "net_inflow_m",
+    "NET_FLOW_L": "net_inflow_l",
+    "NET_FLOW_XL": "net_inflow_xl",
+    "MAIN_FLOW": "main_net_inflow",
+    "SMAIN_FLOW": "retail_net_inflow",
+    "NET_IN_OPN": "net_in_open",
+    "NET_IN_CLS": "net_in_close",
+    "TURNOVER_VALUE": "turnover_value",
+}
+MONEY_FLOW_MAPPER_VERSION = "1"
 
 
 def _read(path: Path) -> pd.DataFrame:
@@ -144,6 +192,75 @@ def _cumulative_flow_rows(
     return source.loc[keep].copy()
 
 
+def _direct_metric_rows(
+    raw: Path,
+    filename: str,
+    batch_id: str,
+    instrument_by_party: dict[int, str],
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for source_name, field_map in HERMES_DIRECT_METRICS.items():
+        source = _read(raw / source_name / filename)
+        if source.empty:
+            continue
+        if "MERGED_FLAG" in source:
+            source = source[source["MERGED_FLAG"].astype(str).eq("1")].copy()
+        source["PUBLISH_DATE"] = pd.to_datetime(
+            source["PUBLISH_DATE"], errors="coerce"
+        ).dt.date
+        source["END_DATE"] = pd.to_datetime(
+            source["END_DATE"], errors="coerce"
+        ).dt.date
+        source["UPDATE_TIME"] = pd.to_datetime(
+            source.get("UPDATE_TIME"), utc=True, errors="coerce"
+        )
+        source = source.dropna(subset=["PARTY_ID", "PUBLISH_DATE", "END_DATE"])
+        source = source.sort_values(
+            ["PARTY_ID", "END_DATE", "PUBLISH_DATE", "UPDATE_TIME", "ID"],
+            kind="mergesort",
+        ).drop_duplicates(
+            ["PARTY_ID", "END_DATE", "PUBLISH_DATE"], keep="last"
+        )
+        for row in source.itertuples(index=False):
+            instrument_id = instrument_by_party.get(int(row.PARTY_ID))
+            if instrument_id is None:
+                continue
+            for source_field, (metric_code, basis, unit, scale) in field_map.items():
+                value = _finite_or_none(getattr(row, source_field, None))
+                if value is None:
+                    continue
+                value *= scale
+                payload = {
+                    "source": source_name,
+                    "id": str(row.ID),
+                    "field": source_field,
+                    "metric": metric_code,
+                    "period": row.END_DATE.isoformat(),
+                    "available": row.PUBLISH_DATE.isoformat(),
+                    "version": "hermes-direct-pit-v1",
+                }
+                metric_id = hash_payload(payload)
+                rows.append({
+                    "metric_id": metric_id,
+                    "instrument_id": instrument_id,
+                    "metric_code": metric_code,
+                    "fiscal_period_end": row.END_DATE,
+                    "basis": basis,
+                    "value": value,
+                    "unit": unit,
+                    "available_at": row.PUBLISH_DATE,
+                    "calculation_version": "hermes-direct-pit-v1",
+                    "source_report_ids": json.dumps(
+                        [f"{source_name}:{row.ID}"], separators=(",", ":")
+                    ),
+                    "quality_status": "complete",
+                    "source_record_id": f"{source_name}:{row.ID}:{source_field}",
+                    "source_batch_id": batch_id,
+                    "source_updated_at": row.UPDATE_TIME,
+                })
+    return pd.DataFrame(rows)
+
+
 def _financial_group_worker(
     raw_root: str,
     canonical_root: str,
@@ -154,6 +271,7 @@ def _financial_group_worker(
     raw = Path(raw_root)
     canonical = Path(canonical_root)
     statements: dict[str, pd.DataFrame] = {}
+    instrument_by_party: dict[int, str] = {}
     excluded = 0
     for source_name, statement_name in FINANCIAL_SOURCE_MAP.items():
         source = _read(raw / source_name / filename)
@@ -163,6 +281,14 @@ def _financial_group_worker(
         consolidated = source["MERGED_FLAG"].astype(str).eq("1")
         excluded += int((~consolidated).sum())
         source = source[consolidated].copy()
+        instrument_by_party.update({
+            int(party): str(code)
+            for party, code in zip(
+                pd.to_numeric(source["PARTY_ID"], errors="coerce"),
+                _instrument_id(source),
+            )
+            if pd.notna(party)
+        })
         source = _cumulative_flow_rows(source, statement_name)
         converted = pd.DataFrame({
             "id": source["ID"],
@@ -198,6 +324,12 @@ def _financial_group_worker(
     result = FinancialProcessor().build(
         statements, trade_days, batch_id, source_name="Hermes"
     )
+    direct = _direct_metric_rows(
+        raw, filename, batch_id, instrument_by_party
+    )
+    metrics = result.metrics
+    if not direct.empty:
+        metrics = pd.concat([metrics, direct], ignore_index=True)
     _write(
         canonical, "financial_reports", filename,
         result.reports,
@@ -208,12 +340,12 @@ def _financial_group_worker(
     )
     _write(
         canonical, "fundamental_metrics", filename,
-        result.metrics,
+        metrics,
     )
     return {
         "reports": len(result.reports),
         "facts": len(result.facts),
-        "metrics": len(result.metrics),
+        "metrics": len(metrics),
         "excluded_non_consolidated": excluded,
     }
 
@@ -258,8 +390,30 @@ class HermesCanonicalizer:
             self._build_share_capital()
             market_quality = self._build_market()
             self._build_valuation()
+            money_flow_quality = (
+                self._build_money_flow()
+                if self.request.include_money_flow
+                else None
+            )
             financial_quality = self._build_financials()
             coverage = self._coverage()
+            capabilities: dict[str, Any] = {
+                "backtest_ready": False,
+                "backtest_block_reason": (
+                    "Hermes does not contain a confirmed complete historical "
+                    "commission/tax/transfer-fee rule series"
+                ),
+                "financials": {
+                    "schema_version": "1.1",
+                    "item_catalog_version": ITEM_CATALOG_VERSION,
+                    "calculation_version": FUNDAMENTAL_CALCULATION_VERSION,
+                    "pit_validated": True,
+                },
+                "exchanges": ["XSHG", "XSHE", "XBEI"],
+                "rights_issue": True,
+            }
+            if money_flow_quality is not None:
+                capabilities["daily_money_flow"] = money_flow_quality
             manifest = {
                 "schema_version": "1.2",
                 "source": "Hermes",
@@ -269,21 +423,8 @@ class HermesCanonicalizer:
                 "coverage": coverage,
                 "excluded_instruments": self.superseded_aliases,
                 "special_treatment_windows": self.special_treatment_windows,
-                "capabilities": {
-                    "backtest_ready": False,
-                    "backtest_block_reason": (
-                        "Hermes does not contain a confirmed complete historical "
-                        "commission/tax/transfer-fee rule series"
-                    ),
-                    "financials": {
-                        "schema_version": "1.1",
-                        "item_catalog_version": ITEM_CATALOG_VERSION,
-                        "calculation_version": FUNDAMENTAL_CALCULATION_VERSION,
-                        "pit_validated": True,
-                    },
-                    "exchanges": ["XSHG", "XSHE", "XBEI"],
-                    "rights_issue": True,
-                },
+                "daily_money_flow": money_flow_quality,
+                "capabilities": capabilities,
             }
             path = self.canonical / "_acquisition_manifest.json"
             temporary = self.canonical / ".partial" / "manifest.tmp"
@@ -1313,6 +1454,138 @@ class HermesCanonicalizer:
                 frame,
             )
 
+    def _build_money_flow(self) -> dict[str, Any]:
+        source_root = self.raw / "mkt_equ_mf_new"
+        required_source = {
+            "TRADE_DATE", "SECURITY_ID", "UPDATE_TIME",
+            *MONEY_FLOW_SOURCE_FIELDS,
+        }
+        total_rows = 0
+        minimum_date: date | None = None
+        maximum_date: date | None = None
+        source_paths = sorted(source_root.rglob("*.parquet"))
+        if not source_paths:
+            raise DataContractError(
+                "money-flow acquisition is enabled but mkt_equ_mf_new "
+                "has no raw partitions"
+            )
+        for source_path in source_paths:
+            relative = source_path.relative_to(source_root)
+            source = _read(source_path)
+            if source.empty:
+                frame = pd.DataFrame(columns=list(FIELD_SPECS["daily_money_flow"]))
+                _write(
+                    self.canonical,
+                    "daily_money_flow",
+                    relative.as_posix(),
+                    frame,
+                )
+                continue
+            missing = required_source - set(source)
+            if missing:
+                raise DataContractError(
+                    "mkt_equ_mf_new is missing required source columns: "
+                    f"{sorted(missing)}"
+                )
+
+            trade_date = pd.to_datetime(
+                source["TRADE_DATE"], errors="coerce"
+            ).dt.date
+            if trade_date.isna().any():
+                raise DataContractError(
+                    "mkt_equ_mf_new.TRADE_DATE contains invalid values"
+                )
+            instrument_id = source["SECURITY_ID"].map(
+                self.instrument_by_security
+            )
+            if instrument_id.isna().any():
+                unknown = source.loc[
+                    instrument_id.isna(), "SECURITY_ID"
+                ].astype(str).unique()[:10]
+                raise DataContractError(
+                    "mkt_equ_mf_new references unknown SECURITY_ID values: "
+                    f"{sorted(unknown)}"
+                )
+            updated_at = pd.to_datetime(
+                source["UPDATE_TIME"], utc=True, errors="coerce"
+            )
+            invalid_update = source["UPDATE_TIME"].notna() & updated_at.isna()
+            if invalid_update.any():
+                raise DataContractError(
+                    "mkt_equ_mf_new.UPDATE_TIME contains invalid values"
+                )
+            local_update_date = updated_at.dt.tz_convert(
+                "Asia/Shanghai"
+            ).dt.date
+            available_at = pd.Series(
+                [
+                    max(day, revised) if pd.notna(revised) else day
+                    for day, revised in zip(trade_date, local_update_date)
+                ],
+                index=source.index,
+                dtype=object,
+            )
+
+            values: dict[str, pd.Series] = {}
+            for source_name, canonical_name in MONEY_FLOW_SOURCE_FIELDS.items():
+                numeric = pd.to_numeric(source[source_name], errors="coerce")
+                invalid = source[source_name].notna() & numeric.isna()
+                if invalid.any():
+                    raise DataContractError(
+                        f"mkt_equ_mf_new.{source_name} contains non-numeric values"
+                    )
+                values[canonical_name] = numeric.astype(float)
+
+            if "ID" in source:
+                record_id = (
+                    "mkt_equ_mf_new:" + source["ID"].astype(str)
+                )
+            else:
+                record_id = (
+                    "mkt_equ_mf_new:"
+                    + source["SECURITY_ID"].astype(str)
+                    + ":"
+                    + trade_date.astype(str)
+                )
+            frame = pd.DataFrame({
+                "trade_date": trade_date,
+                "instrument_id": instrument_id.astype(str),
+                **values,
+                "available_at": available_at,
+                "source_record_id": record_id,
+                "source_batch_id": self.request.job_id,
+                "source_updated_at": updated_at,
+            })
+            _write(
+                self.canonical,
+                "daily_money_flow",
+                relative.as_posix(),
+                frame,
+            )
+            total_rows += len(frame)
+            part_min = min(frame["trade_date"])
+            part_max = max(frame["trade_date"])
+            minimum_date = (
+                part_min if minimum_date is None else min(minimum_date, part_min)
+            )
+            maximum_date = (
+                part_max if maximum_date is None else max(maximum_date, part_max)
+            )
+        return {
+            "schema_version": "1",
+            "source_table": "mkt_equ_mf_new",
+            "mapper_version": MONEY_FLOW_MAPPER_VERSION,
+            "unit": "CNY",
+            "pit_rule": (
+                "available_at=max(trade_date,"
+                "source_updated_at_Asia/Shanghai_date)"
+            ),
+            "rows": total_rows,
+            "start_date": minimum_date.isoformat() if minimum_date else None,
+            "end_date": maximum_date.isoformat() if maximum_date else None,
+            "fields": sorted(FIELD_SPECS["daily_money_flow"]),
+        }
+
     def _build_financials(self) -> dict[str, Any]:
         trade_days = sorted(set(
             pd.to_datetime(
@@ -1435,7 +1708,9 @@ class HermesAcquisitionPublisher:
             ):
                 name = table_path.name
                 if name not in FIELD_SPECS:
-                    continue
+                    raise DataContractError(
+                        f"unregistered canonical table directory: {name}"
+                    )
                 table_files = []
                 rows = 0
                 schemas = set()
@@ -1456,15 +1731,18 @@ class HermesAcquisitionPublisher:
                     }
                     files.append(record)
                     table_files.append(record["path"])
-                if len(schemas) > 1:
-                    dataset = pads.dataset(
-                        table_path, format="parquet", partitioning="hive"
+                dataset = pads.dataset(
+                    table_path, format="parquet", partitioning="hive"
+                )
+                actual = set(dataset.schema.names)
+                unknown_columns = actual - set(FIELD_SPECS[name])
+                missing_columns = set(REQUIRED_COLUMNS[name]) - actual
+                if unknown_columns or missing_columns:
+                    raise DataContractError(
+                        f"{name} has incompatible partition schemas; "
+                        f"missing={sorted(missing_columns)}, "
+                        f"unknown={sorted(unknown_columns)}"
                     )
-                    expected = set(FIELD_SPECS[name])
-                    if set(dataset.schema.names) - expected:
-                        raise DataContractError(
-                            f"{name} has incompatible partition schemas"
-                        )
                 tables.append({
                     "name": name,
                     "rows": rows,
@@ -1481,6 +1759,8 @@ class HermesAcquisitionPublisher:
                 "universe_membership", "industry_membership",
                 "market_rules", *FINANCIAL_TABLES,
             }
+            if "daily_money_flow" in metadata.get("capabilities", {}):
+                required.add("daily_money_flow")
             missing = required - {table["name"] for table in tables}
             if missing:
                 raise DataContractError(
@@ -1531,6 +1811,7 @@ class HermesAcquisitionPublisher:
                     "request_hash": self._request_hash(acquisition),
                     "source_watermark": self._source_watermark(acquisition),
                     "credentials_persisted": False,
+                    "daily_money_flow": metadata.get("daily_money_flow"),
                     "normalization": metadata,
                 },
                 "quality": {

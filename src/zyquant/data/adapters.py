@@ -7,7 +7,7 @@ from typing import Any, Callable, Mapping, Protocol
 import pandas as pd
 
 from zyquant.core.exceptions import DataContractError
-from .contracts import FINANCIAL_TABLES
+from .contracts import FINANCIAL_TABLES, OPTIONAL_TABLES
 
 
 @dataclass(frozen=True)
@@ -41,7 +41,7 @@ class DirectoryDataAdapter:
 
     def ingest(self, request=None) -> CanonicalBatch:
         tables = {name: self._read(name) for name in self.SOURCE_TABLES}
-        for name in FINANCIAL_TABLES:
+        for name in (*FINANCIAL_TABLES, *OPTIONAL_TABLES):
             optional = self._read(name, required=False)
             if optional is not None:
                 tables[name] = optional

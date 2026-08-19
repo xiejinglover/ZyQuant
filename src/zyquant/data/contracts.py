@@ -55,7 +55,7 @@ REPORT_KINDS: Final = frozenset({"current", "comparative"})
 FACT_BASES: Final = frozenset({"instant", "ytd", "per_share", "ratio"})
 METRIC_BASES: Final = frozenset({"instant", "ytd", "single_quarter", "ttm"})
 FINANCIAL_UNITS: Final = frozenset({
-    "CNY", "CNY/share", "shares", "ratio",
+    "CNY", "CNY/share", "shares", "ratio", "percent",
 })
 METRIC_QUALITY: Final = frozenset({
     "complete", "not_applicable", "source_missing",
@@ -82,6 +82,7 @@ FINANCIAL_TABLES: Final = (
 # snapshot published before they existed stays valid.
 OPTIONAL_TABLES: Final = (
     "special_treatment",
+    "daily_money_flow",
 )
 TABLES: Final = BASE_TABLES + FINANCIAL_TABLES + OPTIONAL_TABLES
 
@@ -198,6 +199,75 @@ FIELD_SPECS: Final[dict[str, dict[str, FieldSpec]]] = {
         "effective_to": FieldSpec(DATE, nullable=True),
         "known_at": FieldSpec(
             DATE, description="Announcement date of the transition",
+        ),
+        **SOURCE_FIELDS,
+    },
+    "daily_money_flow": {
+        "trade_date": FieldSpec(DATE),
+        "instrument_id": FieldSpec(STRING),
+        "inflow": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY", minimum=0,
+        ),
+        "outflow": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY", minimum=0,
+        ),
+        "net_inflow": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY",
+        ),
+        "inflow_s": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY", minimum=0,
+        ),
+        "inflow_m": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY", minimum=0,
+        ),
+        "inflow_l": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY", minimum=0,
+        ),
+        "inflow_xl": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY", minimum=0,
+        ),
+        "outflow_s": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY", minimum=0,
+        ),
+        "outflow_m": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY", minimum=0,
+        ),
+        "outflow_l": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY", minimum=0,
+        ),
+        "outflow_xl": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY", minimum=0,
+        ),
+        "net_inflow_s": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY",
+        ),
+        "net_inflow_m": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY",
+        ),
+        "net_inflow_l": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY",
+        ),
+        "net_inflow_xl": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY",
+        ),
+        "main_net_inflow": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY",
+        ),
+        "retail_net_inflow": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY",
+        ),
+        "net_in_open": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY",
+        ),
+        "net_in_close": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY",
+        ),
+        "turnover_value": FieldSpec(
+            FLOAT, nullable=True, required=False, unit="CNY", minimum=0,
+        ),
+        "available_at": FieldSpec(
+            DATE,
+            description="First Asia/Shanghai calendar date the row was known",
         ),
         **SOURCE_FIELDS,
     },
@@ -372,6 +442,7 @@ PRIMARY_KEYS: Final = {
     ),
     "market_rules": ("rule_id",),
     "special_treatment": ("instrument_id", "effective_from"),
+    "daily_money_flow": ("trade_date", "instrument_id"),
     "financial_reports": ("report_id",),
     "financial_facts": ("report_id", "item_code"),
     "fundamental_metrics": ("metric_id",),
@@ -389,4 +460,18 @@ DYNAMIC_TABLES: Final = {
     "universe_membership", "industry_membership", "market_rules",
     "financial_reports", "financial_facts", "fundamental_metrics",
     "daily_valuation", "share_capital", "special_treatment",
+    "daily_money_flow",
+}
+
+VISIBILITY_FIELDS: Final = {
+    "corporate_actions": "announced_at",
+    "universe_membership": "known_at",
+    "industry_membership": "known_at",
+    "financial_reports": "available_at",
+    "financial_facts": "available_at",
+    "fundamental_metrics": "available_at",
+    "daily_valuation": "available_at",
+    "share_capital": "available_at",
+    "special_treatment": "known_at",
+    "daily_money_flow": "available_at",
 }

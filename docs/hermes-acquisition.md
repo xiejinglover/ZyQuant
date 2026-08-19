@@ -28,6 +28,8 @@ job_id: hermes-cn-a-2010-20260724
 start_date: 2010-01-01
 end_date: 2026-07-24
 financial_warmup_start: 2009-01-01
+# 可选；只有显式启用时才检查并采集 mkt_equ_mf_new。
+include_money_flow: true
 limits:
   max_connections: 8
   target_memory_gib: 78
@@ -58,6 +60,23 @@ zyq data acquire --source hermes --action resume \
 
 `resume` 会重新校验已完成文件的 SHA-256，只重拉缺失、损坏、失败或中断的
 分块。改变日期、资源参数、查询或源 schema 会被拒绝，必须创建新 job。
+
+`include_money_flow` 默认为 `false`，因此旧请求不会新增权限要求或采集量。
+启用后，`mkt_equ_mf_new` 按交易月份采集并规范化为可选动态表
+`daily_money_flow`。读取必须显式提供 PIT 截止日期：
+
+```python
+flow = snapshot.table(
+    "daily_money_flow",
+    start=start_date,
+    end=end_date,
+    instruments=instruments,
+    cutoff=cutoff,
+)
+```
+
+资金流属于日终数据；`available_at` 取交易日与上游更新时间对应的
+Asia/Shanghai 日历日二者较晚值。未知值保留为 null，不会转换为 0。
 
 ## 发布
 

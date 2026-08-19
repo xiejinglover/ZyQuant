@@ -12,15 +12,23 @@ from .contracts import BASE_TABLES, FIELD_SPECS, FINANCIAL_TABLES, REQUIRED_COLU
 from .normalization import normalize_table
 
 
+MONEY_FLOW_RTOL = 1e-6
+MONEY_FLOW_ATOL_CNY = 0.01
+
+
 class SnapshotValidator:
     def validate(self, tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        unknown_tables = set(tables) - set(REQUIRED_COLUMNS)
+        if unknown_tables:
+            raise DataContractError(
+                f"unsupported canonical tables: {sorted(unknown_tables)}"
+            )
         missing_tables = set(BASE_TABLES) - set(tables)
         if missing_tables:
             raise DataContractError(f"missing canonical tables: {sorted(missing_tables)}")
         normalized = {
             name: normalize_table(name, tables[name])
             for name in tables
-            if name in REQUIRED_COLUMNS
         }
         self._validate_arrow_compatibility(normalized)
         self._validate_prices(normalized["daily_raw"], normalized["daily_post_adjusted"])
@@ -28,6 +36,8 @@ class SnapshotValidator:
         self._validate_market_rules(normalized["market_rules"])
         if set(FINANCIAL_TABLES) <= set(normalized):
             self._validate_financials(normalized)
+        if "daily_money_flow" in normalized:
+            self._validate_money_flow(normalized)
         return normalized
 
     @staticmethod
@@ -85,6 +95,11 @@ class SnapshotValidator:
             "universe_membership", "industry_membership",
         ]
         related.extend(name for name in FINANCIAL_TABLES if name in tables)
+        related.extend(
+            name
+            for name in ("special_treatment", "daily_money_flow")
+            if name in tables
+        )
         for name in related:
             unknown = set(tables[name]["instrument_id"].astype(str)) - instruments
             if unknown:
@@ -188,6 +203,47 @@ class SnapshotValidator:
                     raise DataContractError(
                         f"overlapping market rules for {exchange}/{asset_type}"
                     )
+
+    @staticmethod
+    def _validate_money_flow(tables: Mapping[str, pd.DataFrame]) -> None:
+        frame = tables["daily_money_flow"]
+        calendar_days = set(tables["trade_calendar"]["trade_date"])
+        unknown_days = set(frame["trade_date"]) - calendar_days
+        if unknown_days:
+            raise DataContractError(
+                "daily_money_flow contains dates outside trade_calendar: "
+                f"{sorted(unknown_days)[:10]}"
+            )
+        if (frame["available_at"] < frame["trade_date"]).any():
+            raise DataContractError(
+                "daily_money_flow.available_at cannot precede trade_date"
+            )
+
+        relationships = (
+            ("inflow", "outflow", "net_inflow"),
+            ("inflow_s", "outflow_s", "net_inflow_s"),
+            ("inflow_m", "outflow_m", "net_inflow_m"),
+            ("inflow_l", "outflow_l", "net_inflow_l"),
+            ("inflow_xl", "outflow_xl", "net_inflow_xl"),
+        )
+        for inflow, outflow, net in relationships:
+            if not {inflow, outflow, net} <= set(frame):
+                continue
+            complete = frame[[inflow, outflow, net]].notna().all(axis=1)
+            if not complete.any():
+                continue
+            expected = frame.loc[complete, inflow] - frame.loc[complete, outflow]
+            actual = frame.loc[complete, net]
+            if not np.isclose(
+                actual.to_numpy(dtype=float),
+                expected.to_numpy(dtype=float),
+                rtol=MONEY_FLOW_RTOL,
+                atol=MONEY_FLOW_ATOL_CNY,
+            ).all():
+                raise DataContractError(
+                    f"daily_money_flow.{net} does not reconcile with "
+                    f"{inflow} - {outflow}"
+                )
 
     @staticmethod
     def _validate_financials(tables: Mapping[str, pd.DataFrame]) -> None:

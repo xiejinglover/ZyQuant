@@ -7,12 +7,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+import pyarrow as pa
 import pytest
 
 from zyquant.core.exceptions import DataContractError
 from zyquant.data import AdjustmentProcessor
+from zyquant.connectors.hermes import request_from_mapping
 from zyquant.connectors.hermes.normalize import (
-    HermesCanonicalizer, _cumulative_flow_rows,
+    MONEY_FLOW_SOURCE_FIELDS, HermesCanonicalizer, _cumulative_flow_rows,
+    _direct_metric_rows,
 )
 from zyquant.connectors.hermes.acquisition import (
     HERMES_SOURCE_TABLES,
@@ -114,6 +117,140 @@ def test_planner_is_deterministic_and_read_only():
     assert {
         chunk.table_name for chunk in first
     } == set(HERMES_SOURCE_TABLES)
+    for table in ("fdmt_main_data_q_pit", "fdmt_md_n_ttmp"):
+        chunk = next(item for item in first if item.table_name == table)
+        assert "PUBLISH_DATE <= %s" in chunk.sql
+        assert "END_DATE >= %s" in chunk.sql
+        assert "EXCHANGE_CD" not in chunk.sql
+
+
+def test_money_flow_acquisition_is_explicit_and_monthly():
+    default = request_from_mapping({})
+    enabled = request_from_mapping({
+        "start_date": "2026-07-01",
+        "end_date": "2026-07-24",
+        "include_money_flow": True,
+    })
+    assert default.include_money_flow is False
+    assert "mkt_equ_mf_new" not in default.source_tables
+    assert "mkt_equ_mf_new" in enabled.source_tables
+
+    chunks = HermesExtractionPlanner(
+        enabled, "2026-07-25 00:00:00.000000"
+    ).plan([[1, 2]])
+    flow = [item for item in chunks if item.table_name == "mkt_equ_mf_new"]
+    assert len(flow) == 1
+    assert flow[0].partition == "2026-07"
+    assert "TRADE_DATE BETWEEN %s AND %s" in flow[0].sql
+    assert "zyq_s.SECURITY_ID=mkt_equ_mf_new.SECURITY_ID" in flow[0].sql
+    with pytest.raises(DataContractError, match="mkt_equ_mf_new"):
+        HermesDataAdapter._validate_inventory(
+            FakeHermesClient().schema_inventory(), enabled.source_tables
+        )
+
+
+def test_money_flow_mapper_preserves_null_zero_and_local_visibility_date():
+    with tempfile.TemporaryDirectory() as directory:
+        request = HermesAcquisitionRequest(
+            job_id="money-flow-job",
+            root=Path(directory),
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            include_money_flow=True,
+        )
+        source_values = {name: 0.0 for name in MONEY_FLOW_SOURCE_FIELDS}
+        source_values.update({
+            "INFLOW": 100.0,
+            "OUTFLOW": 40.0,
+            "NET_FLOW": 60.0,
+            "INFLOW_S": None,
+            "OUTFLOW_S": 0.0,
+            "NET_FLOW_S": None,
+        })
+        source = pd.DataFrame([{
+            "ID": 42,
+            "SECURITY_ID": 2,
+            "TRADE_DATE": date(2024, 1, 2),
+            # 16:30 UTC is 00:30 on the next Asia/Shanghai date.
+            "UPDATE_TIME": pd.Timestamp("2024-01-02 16:30:00", tz="UTC"),
+            **source_values,
+        }])
+        relative = Path("year=2024/month=01/part-2024-01.parquet")
+        raw_path = request.job_root / "raw" / "mkt_equ_mf_new" / relative
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        source.to_parquet(raw_path, index=False)
+
+        canonicalizer = HermesCanonicalizer(request)
+        canonicalizer.instrument_by_security = {2: "000001.XSHE"}
+        metadata = canonicalizer._build_money_flow()
+        frame = pd.read_parquet(
+            canonicalizer.canonical / "daily_money_flow"
+        )
+
+        assert metadata["source_table"] == "mkt_equ_mf_new"
+        assert metadata["rows"] == 1
+        assert frame.iloc[0]["available_at"] == date(2024, 1, 3)
+        assert pd.isna(frame.iloc[0]["inflow_s"])
+        assert frame.iloc[0]["outflow_s"] == 0.0
+        assert frame.iloc[0]["source_batch_id"] == "money-flow-job"
+
+
+def test_hermes_bit_columns_are_preserved_as_binary():
+    inventory = [{
+        "TABLE_NAME": "fdmt_md_n_ttmp",
+        "COLUMN_NAME": "IS_NEW",
+        "ORDINAL_POSITION": 1,
+        "DATA_TYPE": "bit",
+        "IS_NULLABLE": "YES",
+        "COLUMN_KEY": "",
+        "COLUMN_COMMENT": "",
+    }]
+    schema = HermesDataAdapter._arrow_schemas(inventory)["fdmt_md_n_ttmp"]
+    assert schema.field("IS_NEW").type == pa.binary()
+
+
+def test_direct_financial_metrics_keep_pit_date_units_and_latest_revision():
+    with tempfile.TemporaryDirectory() as directory:
+        raw = Path(directory)
+        filename = "group-00000.parquet"
+        quarterly = pd.DataFrame([
+            {
+                "ID": 1, "PARTY_ID": 7, "PUBLISH_DATE": "2024-04-29",
+                "END_DATE": "2024-03-31", "MERGED_FLAG": "1",
+                "ROE": 8.0, "ROE_CUT": 6.0, "T_REVENUE_YOY": 11.0,
+                "NI_YOY": 12.0, "UPDATE_TIME": "2024-04-29 12:00:00",
+            },
+            {
+                "ID": 2, "PARTY_ID": 7, "PUBLISH_DATE": "2024-04-29",
+                "END_DATE": "2024-03-31", "MERGED_FLAG": "1",
+                "ROE": 9.0, "ROE_CUT": 7.0, "T_REVENUE_YOY": 13.0,
+                "NI_YOY": 14.0, "UPDATE_TIME": "2024-04-30 12:00:00",
+            },
+        ])
+        trailing = pd.DataFrame([{
+            "ID": 3, "PARTY_ID": 7, "PUBLISH_DATE": "2024-04-29",
+            "END_DATE": "2024-03-31", "MERGED_FLAG": "1",
+            "EPS": 1.25, "N_CF_OPA_NIA": -2.5,
+            "UPDATE_TIME": "2024-04-29 12:00:00",
+        }])
+        for table, frame in (
+            ("fdmt_main_data_q_pit", quarterly),
+            ("fdmt_md_n_ttmp", trailing),
+        ):
+            target = raw / table / filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            frame.to_parquet(target, index=False)
+
+        got = _direct_metric_rows(
+            raw, filename, "batch", {7: "000001.XSHE"}
+        ).set_index("metric_code")
+        assert len(got) == 6
+        assert got.loc["hermes_roe_q_pct", "value"] == pytest.approx(9.0)
+        assert got.loc["hermes_inc_return_q_pct", "value"] == pytest.approx(7.0)
+        assert got.loc["hermes_inc_return_q_pct", "unit"] == "percent"
+        assert got.loc["hermes_nocf_coverage_ttm", "value"] == pytest.approx(-0.025)
+        assert got.loc["hermes_eps_ttm", "unit"] == "CNY/share"
+        assert set(got["available_at"]) == {date(2024, 4, 29)}
 
 
 def test_empty_acquisition_resumes_without_rewriting_completed_chunks():

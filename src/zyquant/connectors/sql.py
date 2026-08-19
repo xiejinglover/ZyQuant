@@ -7,7 +7,7 @@ import pandas as pd
 from zyquant.core.exceptions import DataContractError
 from zyquant.core.plugins import PluginMetadata
 from zyquant.data.adapters import CanonicalBatch, DirectoryDataAdapter
-from zyquant.data.contracts import FINANCIAL_TABLES
+from zyquant.data.contracts import FINANCIAL_TABLES, OPTIONAL_TABLES
 
 
 class SQLDataAdapter:
@@ -42,7 +42,7 @@ class SQLDataAdapter:
                 else:
                     source = self.table_mapping.get(canonical, canonical)
                     tables[canonical] = pd.read_sql_table(source, engine)
-            for canonical in FINANCIAL_TABLES:
+            for canonical in (*FINANCIAL_TABLES, *OPTIONAL_TABLES):
                 query = queries.get(canonical)
                 source = self.table_mapping.get(canonical, canonical)
                 if query:

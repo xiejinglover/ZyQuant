@@ -44,6 +44,11 @@ class SnapshotPublisher:
         final = self.datasets_root / dataset_id
         if final.exists():
             raise DataContractError(f"immutable dataset already exists: {dataset_id}")
+        unknown_tables = set(tables) - set(FIELD_SPECS)
+        if unknown_tables:
+            raise DataContractError(
+                f"publishing unsupported canonical tables: {sorted(unknown_tables)}"
+            )
         source_tables = set(BASE_TABLES) - {"daily_post_adjusted"}
         missing_source = source_tables - set(tables)
         if missing_source:
@@ -51,11 +56,10 @@ class SnapshotPublisher:
                 f"publishing missing source tables: {sorted(missing_source)}"
             )
         working = {
-            name: normalize_table(name, tables[name]) for name in source_tables
+            name: normalize_table(name, frame)
+            for name, frame in tables.items()
+            if name != "daily_post_adjusted"
         }
-        for name in FINANCIAL_TABLES:
-            if name in tables:
-                working[name] = normalize_table(name, tables[name])
         financial_present = set(FINANCIAL_TABLES) & set(working)
         if financial_present and financial_present != set(FINANCIAL_TABLES):
             raise DataContractError(
@@ -73,6 +77,31 @@ class SnapshotPublisher:
         )
         working["daily_post_adjusted"] = adjusted.daily_post_adjusted
         normalized = SnapshotValidator().validate(working)
+        effective_lineage = dict(lineage or {})
+        if "daily_money_flow" in normalized:
+            flow = normalized["daily_money_flow"]
+            declared_capabilities = effective_lineage.get("capabilities", {})
+            flow_capabilities = (
+                dict(declared_capabilities)
+                if isinstance(declared_capabilities, Mapping)
+                else {}
+            )
+            flow_capabilities.setdefault("daily_money_flow", {
+                "schema_version": "1",
+                "fields": sorted(flow.columns),
+                "start_date": (
+                    str(flow["trade_date"].min()) if not flow.empty else None
+                ),
+                "end_date": (
+                    str(flow["trade_date"].max()) if not flow.empty else None
+                ),
+            })
+            effective_lineage["capabilities"] = flow_capabilities
+            effective_lineage.setdefault("daily_money_flow", {
+                "schema_version": "1",
+                "unit": "CNY",
+                "visibility_field": "available_at",
+            })
         staging = Path(tempfile.mkdtemp(prefix=f".{dataset_id}.", dir=self.datasets_root))
         try:
             for name, frame in normalized.items():
@@ -118,7 +147,7 @@ class SnapshotPublisher:
                 "schema_version": schema_version,
                 "tables": table_manifests,
                 "adjustment_version": adjusted.algorithm_version,
-                "lineage": lineage or {},
+                "lineage": effective_lineage,
             }
             fingerprint = hashlib.sha256(
                 canonical_json(fingerprint_payload).encode("utf-8")
@@ -131,8 +160,8 @@ class SnapshotPublisher:
             if effective_as_of < maximum:
                 raise DataContractError("as_of_date cannot precede the latest calendar date")
             capabilities: dict[str, object] = {}
-            if isinstance(lineage, Mapping):
-                declared_capabilities = lineage.get("capabilities", {})
+            if isinstance(effective_lineage, Mapping):
+                declared_capabilities = effective_lineage.get("capabilities", {})
                 if isinstance(declared_capabilities, Mapping):
                     capabilities = dict(declared_capabilities)
             manifest = {
@@ -153,7 +182,7 @@ class SnapshotPublisher:
                 "files": files,
                 "tables": table_manifests,
                 "capabilities": capabilities,
-                "lineage": dict(lineage or {}),
+                "lineage": effective_lineage,
                 "quality": {
                     "status": "passed",
                     "tables": {

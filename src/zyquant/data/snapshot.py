@@ -15,7 +15,7 @@ from zyquant.core.exceptions import (
 from zyquant.core.hashing import hash_file
 from zyquant.core.versioning import SNAPSHOT_SCHEMA_VERSION
 
-from .contracts import DYNAMIC_TABLES, TABLES
+from .contracts import DYNAMIC_TABLES, FIELD_SPECS, TABLES, VISIBILITY_FIELDS
 from .manifest import SnapshotManifest
 
 
@@ -339,6 +339,7 @@ class DataSnapshot:
             raise DataContractError("snapshot requires materialized post-adjusted bars")
         self.manifest_model = model
         self.manifest = payload
+        self._manifest_tables = {table.name for table in model.tables}
         self.metadata = SnapshotMetadata(
             dataset_id=model.dataset_id,
             schema_version=model.schema_version,
@@ -402,6 +403,10 @@ class DataSnapshot:
         if name in DYNAMIC_TABLES and cutoff is None:
             raise FutureDataError(f"{name} requires an explicit cutoff")
         self._guard(end, cutoff)
+        if name not in self._manifest_tables:
+            raise DataContractError(
+                f"snapshot manifest does not contain table: {name}"
+            )
         path = self.path / name
         if not path.exists():
             raise DataContractError(f"snapshot table does not exist: {name}")
@@ -426,18 +431,32 @@ class DataSnapshot:
             current = pads.field("instrument_id").isin([str(item) for item in instruments])
             predicate = current if predicate is None else predicate & current
         cutoff_date = cutoff.date() if isinstance(cutoff, datetime) else cutoff
-        for visibility in ("known_at", "announced_at", "available_at"):
-            if cutoff_date is not None and visibility in schema_names:
-                current = pads.field(visibility).is_null() | (
-                    pads.field(visibility) <= cutoff_date
-                )
-                predicate = current if predicate is None else predicate & current
+        visibility = VISIBILITY_FIELDS.get(name)
+        if visibility is not None and visibility not in schema_names:
+            raise DataContractError(
+                f"{name} is missing its PIT visibility field: {visibility}"
+            )
+        if (
+            cutoff_date is not None
+            and visibility is not None
+            and visibility in schema_names
+        ):
+            current = pads.field(visibility).is_null() | (
+                pads.field(visibility) <= cutoff_date
+            )
+            predicate = current if predicate is None else predicate & current
         requested = list(fields) if fields is not None else None
         required = [
             column for column in ("trade_date", "instrument_id")
             if column in schema_names
         ]
         if requested is not None:
+            unknown_fields = set(requested) - set(FIELD_SPECS[name])
+            if unknown_fields:
+                raise DataContractError(
+                    f"{name} has unknown requested fields: "
+                    f"{sorted(unknown_fields)}"
+                )
             selected = list(dict.fromkeys(required + requested))
             missing = set(selected) - schema_names
             if missing:
