@@ -7,7 +7,7 @@ import sqlite3
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -110,6 +110,64 @@ MONEY_FLOW_SOURCE_FIELDS = {
     "TURNOVER_VALUE": "turnover_value",
 }
 MONEY_FLOW_MAPPER_VERSION = "1"
+LIMIT_EVENT_MAPPER_VERSION = "1"
+MARGIN_MAPPER_VERSION = "1"
+INTRADAY_FACTOR_MAPPER_VERSION = "1"
+
+LIMIT_EVENT_SOURCE_FIELDS = {
+    "LIMIT_PRICE": "limit_price",
+    "FIRST_LIMIT_VOL": "first_limit_volume",
+    "FIRST_LIMIT_VALUE": "first_limit_value",
+    "LAST_LIMIT_VOL": "last_limit_volume",
+    "LAST_LIMIT_VALUE": "last_limit_value",
+    "LIMIT_VOL_MAX": "max_limit_volume",
+    "LIMIT_VALUE_MAX": "max_limit_value",
+    "LIMIT_VOL_CLOSE": "close_limit_volume",
+    "LIMIT_VALUE_CLOSE": "close_limit_value",
+}
+MARGIN_SOURCE_FIELDS = {
+    "FIN_VAL": "financing_balance",
+    "FIN_BUY_VAL": "financing_buy_value",
+    "FIN_REFUND_VAL": "financing_repayment_value",
+    "SEC_VOL": "securities_lending_balance_volume",
+    "SEC_SELL_VOL": "securities_lending_sell_volume",
+    "SEC_REFUND_VOL": "securities_lending_repayment_volume",
+    "SEC_VAL": "securities_lending_balance_value",
+    "TRADE_VAL": "margin_balance",
+}
+INTRADAY_FACTOR_SOURCE_FIELDS = {
+    "DVN_DVN_CORR": "dvn_dvn_corr",
+    "DVN_DVP_CORR": "dvn_dvp_corr",
+    "DVN_V_CORR": "dvn_v_corr",
+    "DVP_DPN_CORR": "dvp_dpn_corr",
+    "DVP_DPP_CORR": "dvp_dpp_corr",
+    "DVP_DVN_CORR": "dvp_dvn_corr",
+    "DVP_DVP_CORR": "dvp_dvp_corr",
+    "DVP_V_CORR": "dvp_v_corr",
+    "PV_CORR": "price_volume_corr",
+    "RV_CORR": "return_volume_corr",
+    "V_AR_CORR": "volume_leads_amplitude_corr",
+    "VWCE": "volume_weighted_entropy",
+    "VWCR": "weighted_close_ratio",
+    "VWCS": "weighted_close_skew",
+    "BUY_ILLIQ": "buy_illiquidity",
+    "ILLIQ": "shortest_path_illiquidity",
+    "RESILIENCY": "price_resiliency",
+    "SELL_ILLIQ": "sell_illiquidity",
+    "TR_0H": "overnight_turnover_rate",
+    "TR_1H": "hour1_turnover_rate",
+    "TR_2H": "hour2_turnover_rate",
+    "TR_3H": "hour3_turnover_rate",
+    "TR_4H": "hour4_turnover_rate",
+    "TR_PURE_0H": "overnight_pure_turnover_rate",
+    "TR_PURE_1H": "hour1_pure_turnover_rate",
+    "TR_PURE_2H": "hour2_pure_turnover_rate",
+    "TR_PURE_3H": "hour3_pure_turnover_rate",
+    "TR_PURE_4H": "hour4_pure_turnover_rate",
+    "TR_PURE_REFORM": "reformed_pure_turnover_rate",
+    "APT_INFLOW_RATIO": "average_trade_inflow_ratio",
+    "APT_NET_INFLOW_RATIO": "average_trade_net_inflow_ratio",
+}
 
 
 def _read(path: Path) -> pd.DataFrame:
@@ -164,6 +222,94 @@ def _source_fields(frame: pd.DataFrame, prefix: str) -> dict[str, Any]:
             frame.get("UPDATE_TIME"), utc=True, errors="coerce"
         ),
     }
+
+
+def _daily_extension_base(
+    source: pd.DataFrame,
+    source_table: str,
+    instrument_id: pd.Series,
+) -> dict[str, Any]:
+    trade_date = pd.to_datetime(
+        source["TRADE_DATE"], errors="coerce"
+    ).dt.date
+    if trade_date.isna().any():
+        raise DataContractError(
+            f"{source_table}.TRADE_DATE contains invalid values"
+        )
+    if instrument_id.isna().any():
+        identity = (
+            source["SECURITY_ID"]
+            if "SECURITY_ID" in source
+            else source["TICKER_SYMBOL"]
+        )
+        unknown = identity.loc[instrument_id.isna()].astype(str).unique()[:10]
+        raise DataContractError(
+            f"{source_table} references unknown instruments: "
+            f"{sorted(unknown)}"
+        )
+    updated_at = pd.to_datetime(
+        source["UPDATE_TIME"], utc=True, errors="coerce"
+    )
+    invalid_update = source["UPDATE_TIME"].notna() & updated_at.isna()
+    if invalid_update.any():
+        raise DataContractError(
+            f"{source_table}.UPDATE_TIME contains invalid values"
+        )
+    local_update_date = updated_at.dt.tz_convert("Asia/Shanghai").dt.date
+    available_at = pd.Series(
+        [
+            max(day, revised) if pd.notna(revised) else day
+            for day, revised in zip(trade_date, local_update_date)
+        ],
+        index=source.index,
+        dtype=object,
+    )
+    identifiers = source.get("ID")
+    if identifiers is None:
+        identifiers = pd.Series(range(len(source)), index=source.index)
+    return {
+        "trade_date": trade_date,
+        "instrument_id": instrument_id.astype(str),
+        "available_at": available_at,
+        "source_record_id": source_table + ":" + identifiers.astype(str),
+        "source_batch_id": None,
+        "source_updated_at": updated_at,
+    }
+
+
+def _numeric_source_fields(
+    source: pd.DataFrame,
+    source_table: str,
+    mapping: Mapping[str, str],
+) -> dict[str, pd.Series]:
+    values: dict[str, pd.Series] = {}
+    for source_name, canonical_name in mapping.items():
+        numeric = pd.to_numeric(source[source_name], errors="coerce")
+        invalid = source[source_name].notna() & numeric.isna()
+        if invalid.any():
+            raise DataContractError(
+                f"{source_table}.{source_name} contains non-numeric values"
+            )
+        values[canonical_name] = numeric.astype(float)
+    return values
+
+
+def _clock_seconds(
+    values: pd.Series, source_table: str, source_column: str,
+) -> pd.Series:
+    durations = pd.to_timedelta(values, errors="coerce")
+    seconds = durations.dt.total_seconds()
+    invalid = values.notna() & seconds.isna()
+    if invalid.any():
+        raise DataContractError(
+            f"{source_table}.{source_column} contains invalid clock times"
+        )
+    outside = seconds.notna() & ((seconds < 0) | (seconds >= 24 * 60 * 60))
+    if outside.any():
+        raise DataContractError(
+            f"{source_table}.{source_column} is outside a trading day"
+        )
+    return seconds.round().astype("Int64")
 
 
 def _finite_or_none(value: Any) -> float | None:
@@ -365,6 +511,7 @@ class HermesCanonicalizer:
         self.security: pd.DataFrame | None = None
         self.instrument_by_security: dict[int, str] = {}
         self.instrument_by_party: dict[int, str] = {}
+        self.instrument_by_symbol: dict[str, str] = {}
         self.exchange_by_instrument: dict[str, str] = {}
         self.superseded_aliases: list[dict[str, Any]] = []
         self.special_treatment_windows = 0
@@ -395,6 +542,21 @@ class HermesCanonicalizer:
                 if self.request.include_money_flow
                 else None
             )
+            limit_event_quality = (
+                self._build_limit_events()
+                if self.request.include_limit_events
+                else None
+            )
+            margin_quality = (
+                self._build_margin()
+                if self.request.include_margin
+                else None
+            )
+            intraday_factor_quality = (
+                self._build_intraday_factors()
+                if self.request.include_intraday_factors
+                else None
+            )
             financial_quality = self._build_financials()
             coverage = self._coverage()
             capabilities: dict[str, Any] = {
@@ -414,6 +576,13 @@ class HermesCanonicalizer:
             }
             if money_flow_quality is not None:
                 capabilities["daily_money_flow"] = money_flow_quality
+            for name, quality in (
+                ("daily_limit_events", limit_event_quality),
+                ("daily_margin", margin_quality),
+                ("daily_intraday_factors", intraday_factor_quality),
+            ):
+                if quality is not None:
+                    capabilities[name] = quality
             manifest = {
                 "schema_version": "1.2",
                 "source": "Hermes",
@@ -424,6 +593,9 @@ class HermesCanonicalizer:
                 "excluded_instruments": self.superseded_aliases,
                 "special_treatment_windows": self.special_treatment_windows,
                 "daily_money_flow": money_flow_quality,
+                "daily_limit_events": limit_event_quality,
+                "daily_margin": margin_quality,
+                "daily_intraday_factors": intraday_factor_quality,
                 "capabilities": capabilities,
             }
             path = self.canonical / "_acquisition_manifest.json"
@@ -529,6 +701,17 @@ class HermesCanonicalizer:
         self.instrument_by_party = dict(zip(
             source["PARTY_ID"].dropna().astype(int),
             source.loc[source["PARTY_ID"].notna(), "instrument_id"],
+        ))
+        symbol_counts = source.groupby("TICKER_SYMBOL")[
+            "instrument_id"
+        ].nunique()
+        ambiguous_symbols = set(symbol_counts[symbol_counts > 1].index.astype(str))
+        symbol_source = source[
+            ~source["TICKER_SYMBOL"].astype(str).isin(ambiguous_symbols)
+        ]
+        self.instrument_by_symbol = dict(zip(
+            symbol_source["TICKER_SYMBOL"].astype(str),
+            symbol_source["instrument_id"].astype(str),
         ))
         self.exchange_by_instrument = dict(zip(
             source["instrument_id"], source["EXCHANGE_CD"]
@@ -1586,6 +1769,215 @@ class HermesCanonicalizer:
             "fields": sorted(FIELD_SPECS["daily_money_flow"]),
         }
 
+    def _build_daily_extension(
+        self,
+        source_table: str,
+        canonical_table: str,
+        required_source: set[str],
+        mapper_version: str,
+        transform: Callable[[pd.DataFrame], pd.DataFrame],
+    ) -> dict[str, Any]:
+        source_root = self.raw / source_table
+        source_paths = sorted(source_root.rglob("*.parquet"))
+        if not source_paths:
+            raise DataContractError(
+                f"{canonical_table} acquisition is enabled but "
+                f"{source_table} has no raw partitions"
+            )
+        total_rows = 0
+        minimum_date: date | None = None
+        maximum_date: date | None = None
+        for source_path in source_paths:
+            relative = source_path.relative_to(source_root)
+            source = _read(source_path)
+            if source.empty:
+                frame = pd.DataFrame(
+                    columns=list(FIELD_SPECS[canonical_table])
+                )
+            else:
+                missing = required_source - set(source)
+                if missing:
+                    raise DataContractError(
+                        f"{source_table} is missing required source columns: "
+                        f"{sorted(missing)}"
+                    )
+                frame = transform(source)
+            _write(
+                self.canonical,
+                canonical_table,
+                relative.as_posix(),
+                frame,
+            )
+            if frame.empty:
+                continue
+            total_rows += len(frame)
+            part_min = min(frame["trade_date"])
+            part_max = max(frame["trade_date"])
+            minimum_date = (
+                part_min if minimum_date is None else min(minimum_date, part_min)
+            )
+            maximum_date = (
+                part_max if maximum_date is None else max(maximum_date, part_max)
+            )
+        return {
+            "schema_version": "1",
+            "source_table": source_table,
+            "mapper_version": mapper_version,
+            "pit_rule": (
+                "available_at=max(trade_date,"
+                "source_updated_at_Asia/Shanghai_date)"
+            ),
+            "rows": total_rows,
+            "start_date": minimum_date.isoformat() if minimum_date else None,
+            "end_date": maximum_date.isoformat() if maximum_date else None,
+            "fields": sorted(FIELD_SPECS[canonical_table]),
+        }
+
+    def _build_limit_events(self) -> dict[str, Any]:
+        source_table = "mkt_limit_ind"
+        canonical_table = "daily_limit_events"
+        required = {
+            "ID", "TRADE_DATE", "SECURITY_ID", "LIMIT_TYPE",
+            "FIRST_LIMIT_TIME", "LAST_LIMIT_TIME", "UPDATE_TIME",
+            *LIMIT_EVENT_SOURCE_FIELDS,
+        }
+
+        def transform(source: pd.DataFrame) -> pd.DataFrame:
+            source = source.sort_values(
+                ["SECURITY_ID", "TRADE_DATE", "LIMIT_TYPE", "UPDATE_TIME", "ID"],
+                kind="mergesort",
+            ).drop_duplicates(
+                ["SECURITY_ID", "TRADE_DATE", "LIMIT_TYPE"], keep="last"
+            )
+            instrument_id = source["SECURITY_ID"].map(
+                self.instrument_by_security
+            )
+            base = _daily_extension_base(
+                source, source_table, instrument_id
+            )
+            base["source_batch_id"] = self.request.job_id
+            source_codes = source["LIMIT_TYPE"].astype("string")
+            limit_type = source_codes.map({"01": "up", "02": "down"})
+            if limit_type.isna().any():
+                unknown = sorted(source_codes.loc[limit_type.isna()].unique())
+                raise DataContractError(
+                    f"{source_table}.LIMIT_TYPE contains unsupported values: "
+                    f"{unknown}"
+                )
+            first_seconds = _clock_seconds(
+                source["FIRST_LIMIT_TIME"], source_table, "FIRST_LIMIT_TIME"
+            )
+            last_seconds = _clock_seconds(
+                source["LAST_LIMIT_TIME"], source_table, "LAST_LIMIT_TIME"
+            )
+            first_minutes = (
+                (first_seconds.astype(float) - (9 * 60 + 30) * 60) / 60.0
+            ).clip(lower=0)
+            return pd.DataFrame({
+                "trade_date": base["trade_date"],
+                "instrument_id": base["instrument_id"],
+                "limit_type": limit_type.astype(str),
+                "source_limit_type_code": source_codes.astype(str),
+                **_numeric_source_fields(
+                    source, source_table, LIMIT_EVENT_SOURCE_FIELDS
+                ),
+                "first_limit_time_seconds": first_seconds,
+                "last_limit_time_seconds": last_seconds,
+                "first_limit_minutes_from_open": first_minutes,
+                "available_at": base["available_at"],
+                "source_record_id": base["source_record_id"],
+                "source_batch_id": base["source_batch_id"],
+                "source_updated_at": base["source_updated_at"],
+            })
+
+        quality = self._build_daily_extension(
+            source_table, canonical_table, required,
+            LIMIT_EVENT_MAPPER_VERSION, transform,
+        )
+        quality["time_encoding"] = {
+            "first_limit_time_seconds": "seconds after midnight",
+            "last_limit_time_seconds": "seconds after midnight",
+            "first_limit_minutes_from_open": (
+                "max(0,(FIRST_LIMIT_TIME-09:30)/60), wall-clock minutes"
+            ),
+        }
+        quality["limit_type_mapping"] = {"01": "up", "02": "down"}
+        return quality
+
+    def _build_margin(self) -> dict[str, Any]:
+        source_table = "fst_detail"
+        canonical_table = "daily_margin"
+        required = {
+            "ID", "TRADE_DATE", "SECURITY_ID", "UPDATE_TIME",
+            *MARGIN_SOURCE_FIELDS,
+        }
+
+        def transform(source: pd.DataFrame) -> pd.DataFrame:
+            source = source.sort_values(
+                ["SECURITY_ID", "TRADE_DATE", "UPDATE_TIME", "ID"],
+                kind="mergesort",
+            ).drop_duplicates(["SECURITY_ID", "TRADE_DATE"], keep="last")
+            instrument_id = source["SECURITY_ID"].map(
+                self.instrument_by_security
+            )
+            base = _daily_extension_base(
+                source, source_table, instrument_id
+            )
+            base["source_batch_id"] = self.request.job_id
+            return pd.DataFrame({
+                "trade_date": base["trade_date"],
+                "instrument_id": base["instrument_id"],
+                **_numeric_source_fields(
+                    source, source_table, MARGIN_SOURCE_FIELDS
+                ),
+                "available_at": base["available_at"],
+                "source_record_id": base["source_record_id"],
+                "source_batch_id": base["source_batch_id"],
+                "source_updated_at": base["source_updated_at"],
+            })
+
+        return self._build_daily_extension(
+            source_table, canonical_table, required,
+            MARGIN_MAPPER_VERSION, transform,
+        )
+
+    def _build_intraday_factors(self) -> dict[str, Any]:
+        source_table = "equ_h2l_factor_t2"
+        canonical_table = "daily_intraday_factors"
+        required = {
+            "ID", "TRADE_DATE", "TICKER_SYMBOL", "UPDATE_TIME",
+            *INTRADAY_FACTOR_SOURCE_FIELDS,
+        }
+
+        def transform(source: pd.DataFrame) -> pd.DataFrame:
+            source = source.sort_values(
+                ["TICKER_SYMBOL", "TRADE_DATE", "UPDATE_TIME", "ID"],
+                kind="mergesort",
+            ).drop_duplicates(["TICKER_SYMBOL", "TRADE_DATE"], keep="last")
+            instrument_id = source["TICKER_SYMBOL"].astype(str).map(
+                self.instrument_by_symbol
+            )
+            base = _daily_extension_base(
+                source, source_table, instrument_id
+            )
+            base["source_batch_id"] = self.request.job_id
+            return pd.DataFrame({
+                "trade_date": base["trade_date"],
+                "instrument_id": base["instrument_id"],
+                **_numeric_source_fields(
+                    source, source_table, INTRADAY_FACTOR_SOURCE_FIELDS
+                ),
+                "available_at": base["available_at"],
+                "source_record_id": base["source_record_id"],
+                "source_batch_id": base["source_batch_id"],
+                "source_updated_at": base["source_updated_at"],
+            })
+
+        return self._build_daily_extension(
+            source_table, canonical_table, required,
+            INTRADAY_FACTOR_MAPPER_VERSION, transform,
+        )
+
     def _build_financials(self) -> dict[str, Any]:
         trade_days = sorted(set(
             pd.to_datetime(
@@ -1761,6 +2153,12 @@ class HermesAcquisitionPublisher:
             }
             if "daily_money_flow" in metadata.get("capabilities", {}):
                 required.add("daily_money_flow")
+            for optional_table in (
+                "daily_limit_events", "daily_margin",
+                "daily_intraday_factors",
+            ):
+                if optional_table in metadata.get("capabilities", {}):
+                    required.add(optional_table)
             missing = required - {table["name"] for table in tables}
             if missing:
                 raise DataContractError(
