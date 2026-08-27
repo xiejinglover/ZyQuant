@@ -102,6 +102,34 @@ class SnapshotPublisher:
                 "unit": "CNY",
                 "visibility_field": "available_at",
             })
+        for optional_name in (
+            "daily_limit_events", "daily_margin",
+            "daily_intraday_factors",
+        ):
+            if optional_name not in normalized:
+                continue
+            frame = normalized[optional_name]
+            declared_capabilities = effective_lineage.get("capabilities", {})
+            optional_capabilities = (
+                dict(declared_capabilities)
+                if isinstance(declared_capabilities, Mapping)
+                else {}
+            )
+            optional_capabilities.setdefault(optional_name, {
+                "schema_version": "1",
+                "fields": sorted(frame.columns),
+                "start_date": (
+                    str(frame["trade_date"].min()) if not frame.empty else None
+                ),
+                "end_date": (
+                    str(frame["trade_date"].max()) if not frame.empty else None
+                ),
+            })
+            effective_lineage["capabilities"] = optional_capabilities
+            effective_lineage.setdefault(optional_name, {
+                "schema_version": "1",
+                "visibility_field": "available_at",
+            })
         staging = Path(tempfile.mkdtemp(prefix=f".{dataset_id}.", dir=self.datasets_root))
         try:
             for name, frame in normalized.items():

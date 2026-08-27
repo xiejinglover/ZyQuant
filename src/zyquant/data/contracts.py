@@ -60,6 +60,7 @@ FINANCIAL_UNITS: Final = frozenset({
 METRIC_QUALITY: Final = frozenset({
     "complete", "not_applicable", "source_missing",
 })
+LIMIT_EVENT_TYPES: Final = frozenset({"up", "down"})
 
 BASE_TABLES: Final = (
     "instruments",
@@ -83,6 +84,9 @@ FINANCIAL_TABLES: Final = (
 OPTIONAL_TABLES: Final = (
     "special_treatment",
     "daily_money_flow",
+    "daily_limit_events",
+    "daily_margin",
+    "daily_intraday_factors",
 )
 TABLES: Final = BASE_TABLES + FINANCIAL_TABLES + OPTIONAL_TABLES
 
@@ -271,6 +275,164 @@ FIELD_SPECS: Final[dict[str, dict[str, FieldSpec]]] = {
         ),
         **SOURCE_FIELDS,
     },
+    "daily_limit_events": {
+        "trade_date": FieldSpec(DATE),
+        "instrument_id": FieldSpec(STRING),
+        "limit_type": FieldSpec(STRING, enum=LIMIT_EVENT_TYPES),
+        "source_limit_type_code": FieldSpec(
+            STRING,
+            description="Hermes LIMIT_TYPE code retained for source parity",
+        ),
+        "limit_price": FieldSpec(
+            FLOAT, nullable=True, unit="CNY/share", minimum=0,
+        ),
+        "first_limit_time_seconds": FieldSpec(
+            INTEGER, nullable=True, unit="seconds_after_midnight", minimum=0,
+        ),
+        "last_limit_time_seconds": FieldSpec(
+            INTEGER, nullable=True, unit="seconds_after_midnight", minimum=0,
+        ),
+        "first_limit_minutes_from_open": FieldSpec(
+            FLOAT, nullable=True, unit="wall_clock_minutes", minimum=0,
+            description="Wall-clock minutes since 09:30, floored at zero",
+        ),
+        "first_limit_volume": FieldSpec(
+            FLOAT, nullable=True, unit="shares", minimum=0,
+        ),
+        "first_limit_value": FieldSpec(
+            FLOAT, nullable=True, unit="CNY", minimum=0,
+        ),
+        "last_limit_volume": FieldSpec(
+            FLOAT, nullable=True, unit="shares", minimum=0,
+        ),
+        "last_limit_value": FieldSpec(
+            FLOAT, nullable=True, unit="CNY", minimum=0,
+        ),
+        "max_limit_volume": FieldSpec(
+            FLOAT, nullable=True, unit="shares", minimum=0,
+        ),
+        "max_limit_value": FieldSpec(
+            FLOAT, nullable=True, unit="CNY", minimum=0,
+        ),
+        "close_limit_volume": FieldSpec(
+            FLOAT, nullable=True, unit="shares", minimum=0,
+        ),
+        "close_limit_value": FieldSpec(
+            FLOAT, nullable=True, unit="CNY", minimum=0,
+        ),
+        "available_at": FieldSpec(
+            DATE,
+            description="First Asia/Shanghai calendar date the row was known",
+        ),
+        **SOURCE_FIELDS,
+    },
+    "daily_margin": {
+        "trade_date": FieldSpec(DATE),
+        "instrument_id": FieldSpec(STRING),
+        "financing_balance": FieldSpec(
+            FLOAT, nullable=True, unit="CNY", minimum=0,
+        ),
+        "financing_buy_value": FieldSpec(
+            FLOAT, nullable=True, unit="CNY", minimum=0,
+        ),
+        "financing_repayment_value": FieldSpec(
+            FLOAT, nullable=True, unit="CNY", minimum=0,
+        ),
+        "securities_lending_balance_volume": FieldSpec(
+            FLOAT, nullable=True, unit="shares", minimum=0,
+        ),
+        "securities_lending_sell_volume": FieldSpec(
+            FLOAT, nullable=True, unit="shares", minimum=0,
+        ),
+        "securities_lending_repayment_volume": FieldSpec(
+            FLOAT, nullable=True, unit="shares", minimum=0,
+        ),
+        "securities_lending_balance_value": FieldSpec(
+            FLOAT, nullable=True, unit="CNY", minimum=0,
+        ),
+        "margin_balance": FieldSpec(
+            FLOAT, nullable=True, unit="CNY", minimum=0,
+        ),
+        "available_at": FieldSpec(
+            DATE,
+            description="First Asia/Shanghai calendar date the row was known",
+        ),
+        **SOURCE_FIELDS,
+    },
+    "daily_intraday_factors": {
+        "trade_date": FieldSpec(DATE),
+        "instrument_id": FieldSpec(STRING),
+        "dvn_dvn_corr": FieldSpec(FLOAT, nullable=True, required=False),
+        "dvn_dvp_corr": FieldSpec(FLOAT, nullable=True, required=False),
+        "dvn_v_corr": FieldSpec(FLOAT, nullable=True, required=False),
+        "dvp_dpn_corr": FieldSpec(FLOAT, nullable=True, required=False),
+        "dvp_dpp_corr": FieldSpec(FLOAT, nullable=True, required=False),
+        "dvp_dvn_corr": FieldSpec(FLOAT, nullable=True, required=False),
+        "dvp_dvp_corr": FieldSpec(FLOAT, nullable=True, required=False),
+        "dvp_v_corr": FieldSpec(FLOAT, nullable=True, required=False),
+        "price_volume_corr": FieldSpec(
+            FLOAT, nullable=True, required=False,
+            description="Vendor PV_CORR: intraday price-volume correlation",
+        ),
+        "return_volume_corr": FieldSpec(
+            FLOAT, nullable=True, required=False,
+            description="Vendor RV_CORR: intraday return-volume correlation",
+        ),
+        "volume_leads_amplitude_corr": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "volume_weighted_entropy": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "weighted_close_ratio": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "weighted_close_skew": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "buy_illiquidity": FieldSpec(FLOAT, nullable=True, required=False),
+        "shortest_path_illiquidity": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "price_resiliency": FieldSpec(FLOAT, nullable=True, required=False),
+        "sell_illiquidity": FieldSpec(FLOAT, nullable=True, required=False),
+        "overnight_turnover_rate": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "hour1_turnover_rate": FieldSpec(FLOAT, nullable=True, required=False),
+        "hour2_turnover_rate": FieldSpec(FLOAT, nullable=True, required=False),
+        "hour3_turnover_rate": FieldSpec(FLOAT, nullable=True, required=False),
+        "hour4_turnover_rate": FieldSpec(FLOAT, nullable=True, required=False),
+        "overnight_pure_turnover_rate": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "hour1_pure_turnover_rate": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "hour2_pure_turnover_rate": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "hour3_pure_turnover_rate": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "hour4_pure_turnover_rate": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "reformed_pure_turnover_rate": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "average_trade_inflow_ratio": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "average_trade_net_inflow_ratio": FieldSpec(
+            FLOAT, nullable=True, required=False,
+        ),
+        "available_at": FieldSpec(
+            DATE,
+            description="First Asia/Shanghai calendar date the row was known",
+        ),
+        **SOURCE_FIELDS,
+    },
     "industry_membership": {
         "classification": FieldSpec(STRING),
         "industry_id": FieldSpec(STRING),
@@ -443,6 +605,9 @@ PRIMARY_KEYS: Final = {
     "market_rules": ("rule_id",),
     "special_treatment": ("instrument_id", "effective_from"),
     "daily_money_flow": ("trade_date", "instrument_id"),
+    "daily_limit_events": ("trade_date", "instrument_id", "limit_type"),
+    "daily_margin": ("trade_date", "instrument_id"),
+    "daily_intraday_factors": ("trade_date", "instrument_id"),
     "financial_reports": ("report_id",),
     "financial_facts": ("report_id", "item_code"),
     "fundamental_metrics": ("metric_id",),
@@ -461,6 +626,7 @@ DYNAMIC_TABLES: Final = {
     "financial_reports", "financial_facts", "fundamental_metrics",
     "daily_valuation", "share_capital", "special_treatment",
     "daily_money_flow",
+    "daily_limit_events", "daily_margin", "daily_intraday_factors",
 }
 
 VISIBILITY_FIELDS: Final = {
@@ -474,4 +640,7 @@ VISIBILITY_FIELDS: Final = {
     "share_capital": "available_at",
     "special_treatment": "known_at",
     "daily_money_flow": "available_at",
+    "daily_limit_events": "available_at",
+    "daily_margin": "available_at",
+    "daily_intraday_factors": "available_at",
 }

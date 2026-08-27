@@ -38,6 +38,11 @@ class SnapshotValidator:
             self._validate_financials(normalized)
         if "daily_money_flow" in normalized:
             self._validate_money_flow(normalized)
+        for name in (
+            "daily_limit_events", "daily_margin", "daily_intraday_factors",
+        ):
+            if name in normalized:
+                self._validate_daily_extension(name, normalized)
         return normalized
 
     @staticmethod
@@ -97,7 +102,11 @@ class SnapshotValidator:
         related.extend(name for name in FINANCIAL_TABLES if name in tables)
         related.extend(
             name
-            for name in ("special_treatment", "daily_money_flow")
+            for name in (
+                "special_treatment", "daily_money_flow",
+                "daily_limit_events", "daily_margin",
+                "daily_intraday_factors",
+            )
             if name in tables
         )
         for name in related:
@@ -244,6 +253,32 @@ class SnapshotValidator:
                     f"daily_money_flow.{net} does not reconcile with "
                     f"{inflow} - {outflow}"
                 )
+
+    @staticmethod
+    def _validate_daily_extension(
+        name: str, tables: Mapping[str, pd.DataFrame],
+    ) -> None:
+        frame = tables[name]
+        calendar_days = set(tables["trade_calendar"]["trade_date"])
+        unknown_days = set(frame["trade_date"]) - calendar_days
+        if unknown_days:
+            raise DataContractError(
+                f"{name} contains dates outside trade_calendar: "
+                f"{sorted(unknown_days)[:10]}"
+            )
+        if (frame["available_at"] < frame["trade_date"]).any():
+            raise DataContractError(
+                f"{name}.available_at cannot precede trade_date"
+            )
+        if name == "daily_limit_events":
+            for column in (
+                "first_limit_time_seconds", "last_limit_time_seconds",
+            ):
+                values = pd.to_numeric(frame[column], errors="coerce").dropna()
+                if ((values < 0) | (values >= 24 * 60 * 60)).any():
+                    raise DataContractError(
+                        f"{name}.{column} must be seconds within one day"
+                    )
 
     @staticmethod
     def _validate_financials(tables: Mapping[str, pd.DataFrame]) -> None:

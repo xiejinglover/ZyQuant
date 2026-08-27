@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,8 +14,9 @@ from zyquant.core.exceptions import DataContractError
 from zyquant.data import AdjustmentProcessor
 from zyquant.connectors.hermes import request_from_mapping
 from zyquant.connectors.hermes.normalize import (
-    MONEY_FLOW_SOURCE_FIELDS, HermesCanonicalizer, _cumulative_flow_rows,
-    _direct_metric_rows,
+    INTRADAY_FACTOR_SOURCE_FIELDS, LIMIT_EVENT_SOURCE_FIELDS,
+    MARGIN_SOURCE_FIELDS, MONEY_FLOW_SOURCE_FIELDS, HermesCanonicalizer,
+    _cumulative_flow_rows, _direct_metric_rows,
 )
 from zyquant.connectors.hermes.acquisition import (
     HERMES_SOURCE_TABLES,
@@ -24,6 +25,7 @@ from zyquant.connectors.hermes.acquisition import (
     HermesDataAdapter,
     HermesExtractionPlanner,
     HermesResourceLimits,
+    _coerce_source_value,
 )
 
 
@@ -149,6 +151,43 @@ def test_money_flow_acquisition_is_explicit_and_monthly():
         )
 
 
+def test_strategy_extension_acquisition_is_explicit_monthly_and_keyed():
+    default = request_from_mapping({})
+    enabled = request_from_mapping({
+        "start_date": "2026-07-01",
+        "end_date": "2026-07-24",
+        "include_limit_events": True,
+        "include_margin": True,
+        "include_intraday_factors": True,
+    })
+    assert set(enabled.source_tables) - set(default.source_tables) == {
+        "mkt_limit_ind", "fst_detail", "equ_h2l_factor_t2",
+    }
+    chunks = HermesExtractionPlanner(
+        enabled, "2026-07-25 00:00:00.000000"
+    ).plan([[1, 2]])
+    extension = {
+        item.table_name: item
+        for item in chunks
+        if item.table_name in {
+            "mkt_limit_ind", "fst_detail", "equ_h2l_factor_t2",
+        }
+    }
+    assert set(extension) == {
+        "mkt_limit_ind", "fst_detail", "equ_h2l_factor_t2",
+    }
+    assert all(item.partition == "2026-07" for item in extension.values())
+    assert "SECURITY_ID=mkt_limit_ind.SECURITY_ID" in extension[
+        "mkt_limit_ind"
+    ].sql
+    assert "SECURITY_ID=fst_detail.SECURITY_ID" in extension[
+        "fst_detail"
+    ].sql
+    factor_sql = extension["equ_h2l_factor_t2"].sql
+    assert "TICKER_SYMBOL=equ_h2l_factor_t2.TICKER_SYMBOL" in factor_sql
+    assert "ORDER BY TRADE_DATE, TICKER_SYMBOL, ID" in factor_sql
+
+
 def test_money_flow_mapper_preserves_null_zero_and_local_visibility_date():
     with tempfile.TemporaryDirectory() as directory:
         request = HermesAcquisitionRequest(
@@ -195,6 +234,92 @@ def test_money_flow_mapper_preserves_null_zero_and_local_visibility_date():
         assert frame.iloc[0]["source_batch_id"] == "money-flow-job"
 
 
+def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
+    with tempfile.TemporaryDirectory() as directory:
+        request = HermesAcquisitionRequest(
+            job_id="strategy-extension-job",
+            root=Path(directory),
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            include_limit_events=True,
+            include_margin=True,
+            include_intraday_factors=True,
+        )
+        relative = Path("year=2024/month=01/part-2024-01.parquet")
+        common = {
+            "ID": 7,
+            "TRADE_DATE": date(2024, 1, 2),
+            "UPDATE_TIME": pd.Timestamp("2024-01-02 16:30:00", tz="UTC"),
+        }
+
+        limit_values = {name: 0.0 for name in LIMIT_EVENT_SOURCE_FIELDS}
+        limit_values.update({"LIMIT_PRICE": 11.0, "LIMIT_VOL_CLOSE": None})
+        limit_source = pd.DataFrame([{
+            **common,
+            "SECURITY_ID": 2,
+            "LIMIT_TYPE": "01",
+            "FIRST_LIMIT_TIME": "09:40:00",
+            "LAST_LIMIT_TIME": "14:30:00",
+            **limit_values,
+        }])
+        margin_source = pd.DataFrame([{
+            **common,
+            "SECURITY_ID": 2,
+            **{name: float(index + 1) for index, name in enumerate(
+                MARGIN_SOURCE_FIELDS
+            )},
+        }])
+        factor_source = pd.DataFrame([{
+            **common,
+            "TICKER_SYMBOL": "000001",
+            **{name: 0.1 for name in INTRADAY_FACTOR_SOURCE_FIELDS},
+            "PV_CORR": None,
+            "RV_CORR": -0.25,
+        }])
+        for table, frame in (
+            ("mkt_limit_ind", limit_source),
+            ("fst_detail", margin_source),
+            ("equ_h2l_factor_t2", factor_source),
+        ):
+            target = request.job_root / "raw" / table / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            frame.to_parquet(target, index=False)
+
+        canonicalizer = HermesCanonicalizer(request)
+        canonicalizer.instrument_by_security = {2: "000001.XSHE"}
+        canonicalizer.instrument_by_symbol = {"000001": "000001.XSHE"}
+        limit_quality = canonicalizer._build_limit_events()
+        margin_quality = canonicalizer._build_margin()
+        factor_quality = canonicalizer._build_intraday_factors()
+
+        limit = pd.read_parquet(
+            canonicalizer.canonical / "daily_limit_events"
+        ).iloc[0]
+        assert limit_quality["source_table"] == "mkt_limit_ind"
+        assert limit["limit_type"] == "up"
+        assert limit["source_limit_type_code"] == "01"
+        assert limit["first_limit_time_seconds"] == 9 * 3600 + 40 * 60
+        assert limit["first_limit_minutes_from_open"] == pytest.approx(10.0)
+        assert pd.isna(limit["close_limit_volume"])
+        assert limit["available_at"] == date(2024, 1, 3)
+
+        margin = pd.read_parquet(
+            canonicalizer.canonical / "daily_margin"
+        ).iloc[0]
+        assert margin_quality["source_table"] == "fst_detail"
+        assert margin["financing_balance"] == pytest.approx(1.0)
+        assert margin["margin_balance"] == pytest.approx(8.0)
+        assert margin["available_at"] == date(2024, 1, 3)
+
+        factor = pd.read_parquet(
+            canonicalizer.canonical / "daily_intraday_factors"
+        ).iloc[0]
+        assert factor_quality["source_table"] == "equ_h2l_factor_t2"
+        assert pd.isna(factor["price_volume_corr"])
+        assert factor["return_volume_corr"] == pytest.approx(-0.25)
+        assert factor["available_at"] == date(2024, 1, 3)
+
+
 def test_hermes_bit_columns_are_preserved_as_binary():
     inventory = [{
         "TABLE_NAME": "fdmt_md_n_ttmp",
@@ -207,6 +332,12 @@ def test_hermes_bit_columns_are_preserved_as_binary():
     }]
     schema = HermesDataAdapter._arrow_schemas(inventory)["fdmt_md_n_ttmp"]
     assert schema.field("IS_NEW").type == pa.binary()
+
+
+def test_mysql_time_values_are_serialized_for_raw_arrow_schema():
+    assert _coerce_source_value(
+        timedelta(hours=9, minutes=40), pa.string()
+    ) == "9:40:00"
 
 
 def test_direct_financial_metrics_keep_pit_date_units_and_latest_revision():

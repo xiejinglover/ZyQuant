@@ -208,6 +208,40 @@ class DataTests(unittest.TestCase):
                     fields=["not_a_field"],
                 )
 
+    def test_strategy_extension_is_optional_manifested_and_pit_filtered(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tables, days = canonical_tables()
+            tables["daily_margin"] = pd.DataFrame([
+                {
+                    "trade_date": days[0],
+                    "instrument_id": CODE_A,
+                    "financing_balance": 100.0,
+                    "financing_buy_value": 10.0,
+                    "financing_repayment_value": 5.0,
+                    "securities_lending_balance_volume": 4.0,
+                    "securities_lending_sell_volume": 3.0,
+                    "securities_lending_repayment_volume": 2.0,
+                    "securities_lending_balance_value": 20.0,
+                    "margin_balance": 120.0,
+                    "available_at": days[2],
+                }
+            ])
+            snapshot = SnapshotPublisher(temporary).publish(
+                "with-margin", tables
+            )
+            self.assertIn("daily_margin", snapshot.manifest["capabilities"])
+            with self.assertRaises(FutureDataError):
+                snapshot.table("daily_margin")
+            hidden = snapshot.table(
+                "daily_margin", end=days[0], cutoff=days[1]
+            )
+            self.assertTrue(hidden.empty)
+            visible = snapshot.table(
+                "daily_margin", end=days[0], cutoff=days[2]
+            )
+            self.assertEqual(len(visible), 1)
+            self.assertEqual(visible.iloc[0]["financing_balance"], 100.0)
+
     def test_money_flow_reconciliation_and_unknown_tables_fail_fast(self):
         with tempfile.TemporaryDirectory() as temporary:
             tables, days = canonical_tables()

@@ -60,6 +60,11 @@ def request_from_mapping(
         root=Path(payload.get("root", "data")),
         limits=HermesResourceLimits(**limits),
         include_money_flow=_boolean(payload.get("include_money_flow")),
+        include_limit_events=_boolean(payload.get("include_limit_events")),
+        include_margin=_boolean(payload.get("include_margin")),
+        include_intraday_factors=_boolean(
+            payload.get("include_intraday_factors")
+        ),
     )
 
 

@@ -30,6 +30,10 @@ end_date: 2026-07-24
 financial_warmup_start: 2009-01-01
 # 可选；只有显式启用时才检查并采集 mkt_equ_mf_new。
 include_money_flow: true
+# 首板/两融/高频派生扩展表同样必须显式启用。
+include_limit_events: true
+include_margin: true
+include_intraday_factors: true
 limits:
   max_connections: 8
   target_memory_gib: 78
@@ -77,6 +81,35 @@ flow = snapshot.table(
 
 资金流属于日终数据；`available_at` 取交易日与上游更新时间对应的
 Asia/Shanghai 日历日二者较晚值。未知值保留为 null，不会转换为 0。
+
+另外三个可选扩展表按相同的月分区和 PIT 规则采集：
+
+| Hermes 源表 | canonical 表 | 主要用途 |
+|---|---|---|
+| `mkt_limit_ind` | `daily_limit_events` | 首次/末次触板时间、封单量和封单金额 |
+| `fst_detail` | `daily_margin` | 个股融资余额、融资买入/偿还、融券余额 |
+| `equ_h2l_factor_t2` | `daily_intraday_factors` | Hermes 日内价量、换手和流动性派生因子 |
+
+`daily_limit_events.first_limit_time_seconds` 和
+`last_limit_time_seconds` 是午夜起秒数；
+`first_limit_minutes_from_open` 是从 09:30 起算、负值归零的墙钟分钟数。
+Hermes 的 `LIMIT_TYPE=01/02` 分别规范化为 `up/down`，原始代码保留在
+`source_limit_type_code`。三个表都必须通过显式 `cutoff` 读取：
+
+```python
+events = snapshot.table(
+    "daily_limit_events", start=start_date, end=end_date,
+    instruments=instruments, cutoff=cutoff,
+)
+margin = snapshot.table(
+    "daily_margin", start=start_date, end=end_date,
+    instruments=instruments, cutoff=cutoff,
+)
+intraday = snapshot.table(
+    "daily_intraday_factors", start=start_date, end=end_date,
+    instruments=instruments, cutoff=cutoff,
+)
+```
 
 ## 发布
 

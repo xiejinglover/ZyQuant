@@ -48,7 +48,16 @@ HERMES_SOURCE_TABLES = (
     "vw_fdmt_is_new",
     "vw_fdmt_cf_new",
 )
-OPTIONAL_HERMES_SOURCE_TABLES = ("mkt_equ_mf_new",)
+MONEY_FLOW_SOURCE_TABLES = ("mkt_equ_mf_new",)
+LIMIT_EVENT_SOURCE_TABLES = ("mkt_limit_ind",)
+MARGIN_SOURCE_TABLES = ("fst_detail",)
+INTRADAY_FACTOR_SOURCE_TABLES = ("equ_h2l_factor_t2",)
+OPTIONAL_HERMES_SOURCE_TABLES = (
+    *MONEY_FLOW_SOURCE_TABLES,
+    *LIMIT_EVENT_SOURCE_TABLES,
+    *MARGIN_SOURCE_TABLES,
+    *INTRADAY_FACTOR_SOURCE_TABLES,
+)
 MONTHLY_TABLES = {
     "mkt_equd": "TRADE_DATE",
     "mkt_equd_adj_af": "TRADE_DATE",
@@ -57,6 +66,9 @@ MONTHLY_TABLES = {
     "mkt_equd_eval_new": "TRADE_DATE",
     "mkt_div_yield": "TRADE_DATE",
     "mkt_equ_mf_new": "TRADE_DATE",
+    "mkt_limit_ind": "TRADE_DATE",
+    "fst_detail": "TRADE_DATE",
+    "equ_h2l_factor_t2": "TRADE_DATE",
 }
 FINANCIAL_TABLES = {
     "vw_fdmt_bs_new",
@@ -100,7 +112,10 @@ SECURITY_ID_TABLES = {
     "mkt_div_yield",
     "equ_inst_sstate",
     "mkt_equ_mf_new",
+    "mkt_limit_ind",
+    "fst_detail",
 }
+TICKER_SYMBOL_TABLES = {"equ_h2l_factor_t2"}
 DATE_FILTERS = {
     "md_security": "COALESCE(DELIST_DATE, %s) >= %s AND LIST_DATE <= %s",
     "md_trade_cal": "CALENDAR_DATE BETWEEN %s AND %s",
@@ -190,6 +205,9 @@ class HermesAcquisitionRequest:
     root: Path = Path("data")
     limits: HermesResourceLimits = HermesResourceLimits()
     include_money_flow: bool = False
+    include_limit_events: bool = False
+    include_margin: bool = False
+    include_intraday_factors: bool = False
 
     def __post_init__(self) -> None:
         if self.start_date > self.end_date:
@@ -206,8 +224,16 @@ class HermesAcquisitionRequest:
 
     @property
     def source_tables(self) -> tuple[str, ...]:
-        optional = OPTIONAL_HERMES_SOURCE_TABLES if self.include_money_flow else ()
-        return HERMES_SOURCE_TABLES + optional
+        optional: list[str] = []
+        if self.include_money_flow:
+            optional.extend(MONEY_FLOW_SOURCE_TABLES)
+        if self.include_limit_events:
+            optional.extend(LIMIT_EVENT_SOURCE_TABLES)
+        if self.include_margin:
+            optional.extend(MARGIN_SOURCE_TABLES)
+        if self.include_intraday_factors:
+            optional.extend(INTRADAY_FACTOR_SOURCE_TABLES)
+        return HERMES_SOURCE_TABLES + tuple(optional)
 
 
 @dataclass(frozen=True)
@@ -283,6 +309,15 @@ class AcquisitionState:
         payload["financial_warmup_start"] = (
             request.financial_warmup_start.isoformat()
         )
+        # Keep default requests byte-compatible with jobs created before these
+        # optional extension switches existed. Enabling one still changes the
+        # durable request hash and therefore correctly requires a new job.
+        for key in (
+            "include_limit_events", "include_margin",
+            "include_intraday_factors",
+        ):
+            if not payload[key]:
+                payload.pop(key)
         with self._lock:
             existing = self._connection.execute(
                 "SELECT request_json, source_watermark, schema_hash FROM job "
@@ -563,6 +598,19 @@ class ResourceController:
             time.sleep(2.0)
 
 
+def _coerce_source_value(value: Any, arrow_type: pa.DataType) -> Any:
+    """Adapt PyMySQL scalar types to the frozen raw Arrow schema."""
+    if isinstance(value, Decimal):
+        return float(value)
+    # PyMySQL represents MySQL TIME as datetime.timedelta. Raw Hermes schemas
+    # intentionally persist TIME as strings because Arrow time-of-day cannot
+    # represent MySQL's signed or >24-hour values. The canonical mapper parses
+    # the string and applies the narrower trading-session constraints.
+    if isinstance(value, timedelta) and pa.types.is_string(arrow_type):
+        return str(value)
+    return value
+
+
 class HermesExtractionPlanner:
     def __init__(self, request: HermesAcquisitionRequest, watermark: str):
         self.request = request
@@ -601,6 +649,21 @@ class HermesExtractionPlanner:
             predicates.append(
                 "EXISTS (SELECT 1 FROM md_security zyq_s "
                 f"WHERE zyq_s.SECURITY_ID={table}.SECURITY_ID "
+                "AND zyq_s.ASSET_CLASS='E' "
+                "AND zyq_s.TRANS_CURR_CD='CNY' "
+                "AND zyq_s.EXCHANGE_CD IN ('XSHG','XSHE','XBEI') "
+                "AND zyq_s.LIST_DATE <= %s "
+                "AND COALESCE(zyq_s.DELIST_DATE, %s) >= %s)"
+            )
+            parameters.extend([
+                self.request.end_date,
+                self.request.end_date,
+                self.request.start_date,
+            ])
+        if table in TICKER_SYMBOL_TABLES:
+            predicates.append(
+                "EXISTS (SELECT 1 FROM md_security zyq_s "
+                f"WHERE zyq_s.TICKER_SYMBOL={table}.TICKER_SYMBOL "
                 "AND zyq_s.ASSET_CLASS='E' "
                 "AND zyq_s.TRANS_CURR_CD='CNY' "
                 "AND zyq_s.EXCHANGE_CD IN ('XSHG','XSHE','XBEI') "
@@ -685,10 +748,15 @@ class HermesExtractionPlanner:
             predicates.append(f"{date_column} BETWEEN %s AND %s")
             parameters.extend([cursor, upper])
             partition = cursor.strftime("%Y-%m")
+            identity_column = (
+                "TICKER_SYMBOL"
+                if table in TICKER_SYMBOL_TABLES
+                else "SECURITY_ID"
+            )
             sql = (
                 f"SELECT * FROM `{table}` WHERE "
                 + " AND ".join(predicates)
-                + f" ORDER BY {date_column}, SECURITY_ID, ID"
+                + f" ORDER BY {date_column}, {identity_column}, ID"
             )
             output.append(ExtractionChunk(
                 f"{table}:{partition}",
@@ -907,10 +975,8 @@ class HermesDataAdapter:
                     table = pa.Table.from_pylist(
                         [
                             {
-                                key: (
-                                    float(value)
-                                    if isinstance(value, Decimal)
-                                    else value
+                                key: _coerce_source_value(
+                                    value, source_schema.field(key).type
                                 )
                                 for key, value in row.items()
                             }
