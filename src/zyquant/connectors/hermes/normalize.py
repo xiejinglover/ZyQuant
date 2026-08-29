@@ -539,6 +539,7 @@ class HermesCanonicalizer:
         self.instrument_by_symbol: dict[str, str] = {}
         self.exchange_by_instrument: dict[str, str] = {}
         self.superseded_aliases: list[dict[str, Any]] = []
+        self.superseded_symbol_aliases: dict[str, str] = {}
         self.special_treatment_windows = 0
         self.security_master_resolution: dict[str, Any] = {}
         self.instrument_preflight: dict[str, Any] = {}
@@ -670,8 +671,20 @@ class HermesCanonicalizer:
         untraded = ~source["SECURITY_ID"].astype("int64").isin(traded)
         if not untraded.any():
             self.superseded_aliases = []
+            self.superseded_symbol_aliases = {}
             return source
         dropped = source.loc[untraded]
+        kept = source.loc[~untraded].copy()
+        alias_targets: dict[str, str] = {}
+        for row in dropped.itertuples(index=False):
+            if pd.isna(row.PARTY_ID):
+                continue
+            candidates = kept[
+                kept["PARTY_ID"].eq(row.PARTY_ID)
+            ]["instrument_id"].astype(str).unique()
+            if len(candidates) == 1:
+                alias_targets[str(row.TICKER_SYMBOL)] = str(candidates[0])
+        self.superseded_symbol_aliases = alias_targets
         self.superseded_aliases = [
             {
                 "instrument_id": str(row.instrument_id),
@@ -690,10 +703,11 @@ class HermesCanonicalizer:
                     None if pd.isna(row.PARTY_ID) else int(row.PARTY_ID)
                 ),
                 "reason": "no_market_data_in_window",
+                "mapped_to": alias_targets.get(str(row.TICKER_SYMBOL)),
             }
             for row in dropped.itertuples(index=False)
         ]
-        return source.loc[~untraded].copy()
+        return kept
 
     def _build_instruments(self) -> None:
         source = _read(self.raw / "md_security" / "part-all.parquet")
@@ -747,6 +761,13 @@ class HermesCanonicalizer:
             symbol_source["TICKER_SYMBOL"].astype(str),
             symbol_source["instrument_id"].astype(str),
         ))
+        for symbol, target in self.superseded_symbol_aliases.items():
+            existing = self.instrument_by_symbol.get(symbol)
+            if existing is not None and existing != target:
+                raise DataContractError(
+                    f"superseded symbol alias conflicts with live symbol: {symbol}"
+                )
+            self.instrument_by_symbol[symbol] = target
         self.exchange_by_instrument = dict(zip(
             source["instrument_id"], source["EXCHANGE_CD"]
         ))
@@ -2266,13 +2287,21 @@ class HermesCanonicalizer:
             *INTRADAY_FACTOR_SOURCE_FIELDS,
         }
 
-        mapping_quality = {"unknown_instrument_rows_dropped": 0}
+        mapping_quality = {
+            "superseded_symbol_alias_rows": 0,
+            "unknown_instrument_rows_dropped": 0,
+        }
 
         def transform(source: pd.DataFrame) -> pd.DataFrame:
             source = source.sort_values(
                 ["TICKER_SYMBOL", "TRADE_DATE", "UPDATE_TIME", "ID"],
                 kind="mergesort",
             ).drop_duplicates(["TICKER_SYMBOL", "TRADE_DATE"], keep="last")
+            mapping_quality["superseded_symbol_alias_rows"] += int(
+                source["TICKER_SYMBOL"].astype(str).isin(
+                    self.superseded_symbol_aliases
+                ).sum()
+            )
             instrument_id = source["TICKER_SYMBOL"].astype(str).map(
                 self.instrument_by_symbol
             )
