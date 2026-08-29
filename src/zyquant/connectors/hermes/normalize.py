@@ -277,6 +277,16 @@ def _daily_extension_base(
     }
 
 
+def _filter_known_extension_instruments(
+    source: pd.DataFrame,
+    instrument_id: pd.Series,
+    quality: dict[str, int],
+) -> tuple[pd.DataFrame, pd.Series]:
+    known = instrument_id.notna()
+    quality["unknown_instrument_rows_dropped"] += int((~known).sum())
+    return source.loc[known].copy(), instrument_id.loc[known]
+
+
 def _numeric_source_fields(
     source: pd.DataFrame,
     source_table: str,
@@ -1842,6 +1852,11 @@ class HermesCanonicalizer:
             *LIMIT_EVENT_SOURCE_FIELDS,
         }
 
+        mapping_quality = {
+            "symbol_fallback_rows": 0,
+            "unknown_instrument_rows_dropped": 0,
+        }
+
         def transform(source: pd.DataFrame) -> pd.DataFrame:
             source = source.sort_values(
                 ["SECURITY_ID", "TRADE_DATE", "LIMIT_TYPE", "UPDATE_TIME", "ID"],
@@ -1851,6 +1866,18 @@ class HermesCanonicalizer:
             )
             instrument_id = source["SECURITY_ID"].map(
                 self.instrument_by_security
+            )
+            if "TICKER_SYMBOL" in source:
+                fallback = source["TICKER_SYMBOL"].astype(str).map(
+                    self.instrument_by_symbol
+                )
+                fallback_rows = instrument_id.isna() & fallback.notna()
+                mapping_quality["symbol_fallback_rows"] += int(
+                    fallback_rows.sum()
+                )
+                instrument_id = instrument_id.fillna(fallback)
+            source, instrument_id = _filter_known_extension_instruments(
+                source, instrument_id, mapping_quality
             )
             base = _daily_extension_base(
                 source, source_table, instrument_id
@@ -1902,6 +1929,7 @@ class HermesCanonicalizer:
             ),
         }
         quality["limit_type_mapping"] = {"01": "up", "02": "down"}
+        quality.update(mapping_quality)
         return quality
 
     def _build_margin(self) -> dict[str, Any]:
@@ -1912,6 +1940,8 @@ class HermesCanonicalizer:
             *MARGIN_SOURCE_FIELDS,
         }
 
+        mapping_quality = {"unknown_instrument_rows_dropped": 0}
+
         def transform(source: pd.DataFrame) -> pd.DataFrame:
             source = source.sort_values(
                 ["SECURITY_ID", "TRADE_DATE", "UPDATE_TIME", "ID"],
@@ -1919,6 +1949,9 @@ class HermesCanonicalizer:
             ).drop_duplicates(["SECURITY_ID", "TRADE_DATE"], keep="last")
             instrument_id = source["SECURITY_ID"].map(
                 self.instrument_by_security
+            )
+            source, instrument_id = _filter_known_extension_instruments(
+                source, instrument_id, mapping_quality
             )
             base = _daily_extension_base(
                 source, source_table, instrument_id
@@ -1936,10 +1969,12 @@ class HermesCanonicalizer:
                 "source_updated_at": base["source_updated_at"],
             })
 
-        return self._build_daily_extension(
+        quality = self._build_daily_extension(
             source_table, canonical_table, required,
             MARGIN_MAPPER_VERSION, transform,
         )
+        quality.update(mapping_quality)
+        return quality
 
     def _build_intraday_factors(self) -> dict[str, Any]:
         source_table = "equ_h2l_factor_t2"
@@ -1949,6 +1984,8 @@ class HermesCanonicalizer:
             *INTRADAY_FACTOR_SOURCE_FIELDS,
         }
 
+        mapping_quality = {"unknown_instrument_rows_dropped": 0}
+
         def transform(source: pd.DataFrame) -> pd.DataFrame:
             source = source.sort_values(
                 ["TICKER_SYMBOL", "TRADE_DATE", "UPDATE_TIME", "ID"],
@@ -1956,6 +1993,9 @@ class HermesCanonicalizer:
             ).drop_duplicates(["TICKER_SYMBOL", "TRADE_DATE"], keep="last")
             instrument_id = source["TICKER_SYMBOL"].astype(str).map(
                 self.instrument_by_symbol
+            )
+            source, instrument_id = _filter_known_extension_instruments(
+                source, instrument_id, mapping_quality
             )
             base = _daily_extension_base(
                 source, source_table, instrument_id
@@ -1973,10 +2013,12 @@ class HermesCanonicalizer:
                 "source_updated_at": base["source_updated_at"],
             })
 
-        return self._build_daily_extension(
+        quality = self._build_daily_extension(
             source_table, canonical_table, required,
             INTRADAY_FACTOR_MAPPER_VERSION, transform,
         )
+        quality.update(mapping_quality)
+        return quality
 
     def _build_financials(self) -> dict[str, Any]:
         trade_days = sorted(set(
