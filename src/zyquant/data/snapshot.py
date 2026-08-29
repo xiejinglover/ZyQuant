@@ -8,6 +8,7 @@ from typing import Sequence
 
 import pandas as pd
 import pyarrow.dataset as pads
+import pyarrow.parquet as pq
 
 from zyquant.core.exceptions import (
     DataContractError, FutureDataError, SchemaVersionError,
@@ -17,6 +18,23 @@ from zyquant.core.versioning import SNAPSHOT_SCHEMA_VERSION
 
 from .contracts import DYNAMIC_TABLES, FIELD_SPECS, TABLES, VISIBILITY_FIELDS
 from .manifest import SnapshotManifest
+
+
+def _open_partitioned_dataset(path: Path) -> pads.Dataset:
+    """Open Parquet partitions using a non-empty file as schema authority."""
+    files = sorted(path.rglob("*.parquet"))
+    if not files:
+        raise DataContractError(f"snapshot table has no parquet files: {path}")
+    for index, file_path in enumerate(files):
+        if pq.ParquetFile(file_path).metadata.num_rows:
+            files[0], files[index] = files[index], files[0]
+            break
+    return pads.dataset(
+        files,
+        format="parquet",
+        partitioning="hive",
+        partition_base_dir=str(path),
+    )
 
 
 @dataclass(frozen=True)
@@ -410,7 +428,7 @@ class DataSnapshot:
         path = self.path / name
         if not path.exists():
             raise DataContractError(f"snapshot table does not exist: {name}")
-        dataset = pads.dataset(path, format="parquet", partitioning="hive")
+        dataset = _open_partitioned_dataset(path)
         schema_names = set(dataset.schema.names)
         predicate = None
         date_column = "trade_date" if "trade_date" in schema_names else None
