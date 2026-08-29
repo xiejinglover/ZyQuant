@@ -205,7 +205,12 @@ def _write(
 def _dataset_payload_columns(table_path: Path) -> set[str]:
     """Return stored columns, excluding virtual Hive partition columns."""
     dataset = pads.dataset(table_path, format="parquet", partitioning="hive")
-    partition_columns = set(dataset.partitioning.schema.names)
+    partition_columns = {
+        part.split("=", 1)[0]
+        for source in table_path.rglob("*.parquet")
+        for part in source.relative_to(table_path).parts[:-1]
+        if "=" in part and part.split("=", 1)[0]
+    }
     return set(dataset.schema.names) - partition_columns
 
 

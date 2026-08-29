@@ -114,6 +114,15 @@ def test_dataset_payload_columns_excludes_hive_partitions(tmp_path):
     }
 
 
+def test_dataset_payload_columns_keeps_unpartitioned_columns(tmp_path):
+    pd.DataFrame({
+        "instrument_id": ["002058.XSHE"],
+        "name": ["威尔泰"],
+    }).to_parquet(tmp_path / "part.parquet", index=False)
+
+    assert _dataset_payload_columns(tmp_path) == {"instrument_id", "name"}
+
+
 def test_planner_is_deterministic_and_read_only():
     request = HermesAcquisitionRequest(
         start_date=date(2026, 7, 1),
