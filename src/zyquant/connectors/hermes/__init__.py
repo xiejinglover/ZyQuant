@@ -65,6 +65,13 @@ def request_from_mapping(
         include_intraday_factors=_boolean(
             payload.get("include_intraday_factors")
         ),
+        instrument_resolution_policy=str(
+            payload.get("instrument_resolution_policy", "repair_or_fail")
+        ),
+        security_master_repair_manifest=(
+            Path(payload["security_master_repair_manifest"])
+            if payload.get("security_master_repair_manifest") else None
+        ),
     )
 
 

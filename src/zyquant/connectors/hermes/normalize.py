@@ -281,9 +281,24 @@ def _filter_known_extension_instruments(
     source: pd.DataFrame,
     instrument_id: pd.Series,
     quality: dict[str, int],
+    *,
+    policy: str = "repair_or_fail",
+    source_table: str = "Hermes extension table",
 ) -> tuple[pd.DataFrame, pd.Series]:
     known = instrument_id.notna()
-    quality["unknown_instrument_rows_dropped"] += int((~known).sum())
+    missing = int((~known).sum())
+    if missing and policy == "repair_or_fail":
+        identity = (
+            source["SECURITY_ID"]
+            if "SECURITY_ID" in source else source["TICKER_SYMBOL"]
+        )
+        examples = sorted(identity.loc[~known].astype(str).unique())[:10]
+        raise DataContractError(
+            f"{source_table} references {missing} unresolved instrument rows; "
+            f"examples={examples}. Supply an audited security-master repair "
+            "or explicitly use instrument_resolution_policy=drop_with_quality"
+        )
+    quality["unknown_instrument_rows_dropped"] += missing
     return source.loc[known].copy(), instrument_id.loc[known]
 
 
@@ -525,6 +540,8 @@ class HermesCanonicalizer:
         self.exchange_by_instrument: dict[str, str] = {}
         self.superseded_aliases: list[dict[str, Any]] = []
         self.special_treatment_windows = 0
+        self.security_master_resolution: dict[str, Any] = {}
+        self.instrument_preflight: dict[str, Any] = {}
 
     def run(self, resume: bool = False) -> dict[str, Any]:
         state = AcquisitionState(self.root / "state.sqlite")
@@ -537,7 +554,9 @@ class HermesCanonicalizer:
                     "source acquisition must complete before normalization"
                 )
             state.set_job_status("normalizing")
+            (self.canonical / "_SUCCESS").unlink(missing_ok=True)
             self._build_instruments()
+            self.instrument_preflight = self._validate_extension_references()
             self._build_special_treatment()
             self._build_calendar()
             self._build_universe()
@@ -602,6 +621,8 @@ class HermesCanonicalizer:
                 "coverage": coverage,
                 "excluded_instruments": self.superseded_aliases,
                 "special_treatment_windows": self.special_treatment_windows,
+                "security_master_resolution": self.security_master_resolution,
+                "instrument_preflight": self.instrument_preflight,
                 "daily_money_flow": money_flow_quality,
                 "daily_limit_events": limit_event_quality,
                 "daily_margin": margin_quality,
@@ -678,11 +699,14 @@ class HermesCanonicalizer:
         source = _read(self.raw / "md_security" / "part-all.parquet")
         if source.empty:
             raise DataContractError("Hermes md_security returned no A-share rows")
+        raw_rows = len(source)
+        source, repair_quality = self._apply_security_master_repair(source)
         source = source[
             source["EXCHANGE_CD"].isin(self.request.exchanges)
             & source["ASSET_CLASS"].eq("E")
             & source["TRANS_CURR_CD"].fillna("CNY").eq("CNY")
         ].copy()
+        source, history_quality = self._resolve_historical_names(source)
         source["instrument_id"] = _instrument_id(source)
         source.sort_values(
             ["instrument_id", "LIST_DATE", "UPDATE_TIME", "SECURITY_ID"],
@@ -726,6 +750,260 @@ class HermesCanonicalizer:
         self.exchange_by_instrument = dict(zip(
             source["instrument_id"], source["EXCHANGE_CD"]
         ))
+        self.security_master_resolution = {
+            "policy": self.request.instrument_resolution_policy,
+            "raw_rows": raw_rows,
+            "canonical_identity_rows": len(source),
+            **repair_quality,
+            **history_quality,
+        }
+
+    def _apply_security_master_repair(
+        self, source: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        configured = self.request.security_master_repair_manifest
+        default = self.root / "repairs" / "security_master_manifest.json"
+        manifest_path = (
+            configured.expanduser().resolve() if configured is not None
+            else default.resolve()
+        )
+        empty = {
+            "repair_rows": 0,
+            "repair_manifest": None,
+            "repair_manifest_sha256": None,
+            "repair_overlay_sha256": None,
+            "parent_dataset": None,
+        }
+        if not manifest_path.exists():
+            if configured is not None:
+                raise DataContractError(
+                    f"security-master repair manifest does not exist: {manifest_path}"
+                )
+            return source, empty
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema_version") != "1":
+            raise DataContractError("unsupported security-master repair schema")
+        if manifest.get("job_id") != self.request.job_id:
+            raise DataContractError("security-master repair job_id mismatch")
+        if manifest.get("as_of_date") != self.request.end_date.isoformat():
+            raise DataContractError("security-master repair as_of_date mismatch")
+        overlay_value = manifest.get("overlay")
+        if not overlay_value:
+            raise DataContractError("security-master repair overlay is missing")
+        overlay = (manifest_path.parent / str(overlay_value)).resolve()
+        if not overlay.is_relative_to(manifest_path.parent.resolve()):
+            raise DataContractError("security-master repair overlay escapes its directory")
+        expected_hash = str(manifest.get("overlay_sha256", ""))
+        if not overlay.is_file() or hash_file(overlay) != expected_hash:
+            raise DataContractError("security-master repair overlay hash mismatch")
+        repaired = _read(overlay)
+        if set(repaired.columns) != set(source.columns):
+            raise DataContractError(
+                "security-master repair overlay schema differs from raw md_security"
+            )
+        if repaired.empty or repaired["SECURITY_ID"].duplicated().any():
+            raise DataContractError(
+                "security-master repair overlay must contain unique records"
+            )
+        raw_ids = set(source["SECURITY_ID"].dropna().astype(int))
+        repair_ids = set(repaired["SECURITY_ID"].dropna().astype(int))
+        conflicts = sorted(raw_ids & repair_ids)
+        if conflicts:
+            raise DataContractError(
+                f"security-master repair would overwrite raw identities: {conflicts[:10]}"
+            )
+        records = manifest.get("records")
+        if not isinstance(records, list):
+            raise DataContractError("security-master repair records must be a list")
+        records_by_id = {int(item["security_id"]): item for item in records}
+        if set(records_by_id) != repair_ids:
+            raise DataContractError("security-master repair record ids do not match overlay")
+        for row in repaired.itertuples(index=False):
+            security_id = int(row.SECURITY_ID)
+            record = records_by_id[security_id]
+            instrument_id = f"{row.TICKER_SYMBOL}.{row.EXCHANGE_CD}"
+            if record.get("instrument_id") != instrument_id:
+                raise DataContractError(
+                    f"security-master repair instrument mismatch for {security_id}"
+                )
+            if record.get("historical_name") != row.SEC_SHORT_NAME:
+                raise DataContractError(
+                    f"security-master repair name mismatch for {security_id}"
+                )
+            begin = date.fromisoformat(str(record["effective_from"]))
+            end_value = record.get("effective_to")
+            end = date.fromisoformat(str(end_value)) if end_value else None
+            if self.request.end_date < begin or (
+                end is not None and self.request.end_date > end
+            ):
+                raise DataContractError(
+                    f"security-master repair name is not effective for {security_id}"
+                )
+        self._validate_repair_evidence(repaired, records_by_id)
+        combined = pd.concat([source, repaired[source.columns]], ignore_index=True)
+        return combined, {
+            "repair_rows": len(repaired),
+            "repair_manifest": str(manifest_path),
+            "repair_manifest_sha256": hash_file(manifest_path),
+            "repair_overlay_sha256": expected_hash,
+            "parent_dataset": manifest.get("parent_dataset"),
+        }
+
+    def _validate_repair_evidence(
+        self,
+        repaired: pd.DataFrame,
+        records_by_id: Mapping[int, Mapping[str, Any]],
+    ) -> None:
+        symbol_path = self.raw / "md_sec_symbol" / "part-all.parquet"
+        change_path = self.raw / "md_sec_chg" / "part-all.parquet"
+        if not symbol_path.exists() or not change_path.exists():
+            raise DataContractError(
+                "security-master repair requires md_sec_symbol and md_sec_chg evidence"
+            )
+        symbols = _read(symbol_path)
+        changes = _read(change_path)
+        symbol_required = {
+            "SECURITY_ID", "MAP_SYMBOL", "MAP_SYMBOL_EX_CD",
+            "BEGIN_DATE", "END_DATE",
+        }
+        change_required = {
+            "SECURITY_ID", "SEC_INFO_TYPE", "VALUE",
+            "BEGIN_DATE", "END_DATE",
+        }
+        if symbol_required - set(symbols.columns):
+            raise DataContractError("md_sec_symbol evidence schema is incomplete")
+        if change_required - set(changes.columns):
+            raise DataContractError("md_sec_chg evidence schema is incomplete")
+        for frame in (symbols, changes):
+            frame["BEGIN_DATE"] = pd.to_datetime(
+                frame["BEGIN_DATE"], errors="coerce"
+            )
+            frame["END_DATE"] = pd.to_datetime(
+                frame["END_DATE"], errors="coerce"
+            )
+        as_of = pd.Timestamp(self.request.end_date)
+        for row in repaired.itertuples(index=False):
+            security_id = int(row.SECURITY_ID)
+            active_symbol = symbols[
+                symbols["SECURITY_ID"].eq(security_id)
+                & symbols["BEGIN_DATE"].notna()
+                & symbols["BEGIN_DATE"].le(as_of)
+                & (symbols["END_DATE"].isna() | symbols["END_DATE"].ge(as_of))
+                & symbols["MAP_SYMBOL"].astype(str).eq(str(row.TICKER_SYMBOL))
+                & symbols["MAP_SYMBOL_EX_CD"].astype(str).eq(str(row.EXCHANGE_CD))
+            ]
+            if active_symbol.empty:
+                raise DataContractError(
+                    f"md_sec_symbol does not support repaired identity {security_id}"
+                )
+            record = records_by_id[security_id]
+            active_name = changes[
+                changes["SECURITY_ID"].eq(security_id)
+                & changes["SEC_INFO_TYPE"].astype(str).eq("0101")
+                & changes["BEGIN_DATE"].notna()
+                & changes["BEGIN_DATE"].le(as_of)
+                & (changes["END_DATE"].isna() | changes["END_DATE"].ge(as_of))
+                & changes["VALUE"].astype(str).eq(str(record["historical_name"]))
+            ]
+            if active_name.empty:
+                raise DataContractError(
+                    f"md_sec_chg does not support repaired name {security_id}"
+                )
+
+    def _resolve_historical_names(
+        self, source: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        path = self.raw / "md_sec_chg" / "part-all.parquet"
+        if not path.exists():
+            return source, {"historical_names_resolved": 0}
+        changes = _read(path)
+        required = {
+            "ID", "SECURITY_ID", "SEC_INFO_TYPE", "VALUE",
+            "BEGIN_DATE", "END_DATE", "UPDATE_TIME",
+        }
+        missing = required - set(changes.columns)
+        if missing:
+            raise DataContractError(
+                f"md_sec_chg is missing columns: {sorted(missing)}"
+            )
+        changes = changes[changes["SEC_INFO_TYPE"].astype(str).eq("0101")].copy()
+        changes["BEGIN_DATE"] = pd.to_datetime(
+            changes["BEGIN_DATE"], errors="coerce"
+        )
+        changes["END_DATE"] = pd.to_datetime(
+            changes["END_DATE"], errors="coerce"
+        )
+        as_of = pd.Timestamp(self.request.end_date)
+        active = changes[
+            changes["BEGIN_DATE"].notna()
+            & changes["BEGIN_DATE"].le(as_of)
+            & (changes["END_DATE"].isna() | changes["END_DATE"].ge(
+                as_of
+            ))
+            & changes["VALUE"].notna()
+        ].copy()
+        active.sort_values(
+            ["SECURITY_ID", "BEGIN_DATE", "UPDATE_TIME", "ID"],
+            kind="mergesort", inplace=True,
+        )
+        active = active.drop_duplicates("SECURITY_ID", keep="last")
+        names = dict(zip(active["SECURITY_ID"].astype(int), active["VALUE"]))
+        resolved = source["SECURITY_ID"].astype(int).map(names)
+        count = int(resolved.notna().sum())
+        source = source.copy()
+        source.loc[resolved.notna(), "SEC_SHORT_NAME"] = resolved[resolved.notna()]
+        return source, {"historical_names_resolved": count}
+
+    def _validate_extension_references(self) -> dict[str, Any]:
+        checks: list[tuple[
+            str, str, Mapping[Any, str], str | None, Mapping[Any, str] | None,
+        ]] = []
+        if self.request.include_limit_events:
+            checks.append((
+                "mkt_limit_ind", "SECURITY_ID", self.instrument_by_security,
+                "TICKER_SYMBOL", self.instrument_by_symbol,
+            ))
+        if self.request.include_margin:
+            checks.append((
+                "fst_detail", "SECURITY_ID", self.instrument_by_security,
+                None, None,
+            ))
+        if self.request.include_intraday_factors:
+            checks.append((
+                "equ_h2l_factor_t2", "TICKER_SYMBOL", self.instrument_by_symbol,
+                None, None,
+            ))
+        output: dict[str, Any] = {}
+        unresolved_total = 0
+        for table, column, mapping, fallback_column, fallback_mapping in checks:
+            rows = 0
+            unresolved = 0
+            examples: set[str] = set()
+            for path in sorted((self.raw / table).rglob("*.parquet")):
+                columns = [column]
+                if fallback_column is not None:
+                    columns.append(fallback_column)
+                frame = pd.read_parquet(path, columns=columns)
+                keys = frame[column].astype(int) if column == "SECURITY_ID" else frame[column].astype(str)
+                known = keys.isin(mapping)
+                if fallback_column is not None and fallback_mapping is not None:
+                    known |= frame[fallback_column].astype(str).isin(fallback_mapping)
+                rows += len(frame)
+                unresolved += int((~known).sum())
+                examples.update(keys.loc[~known].astype(str).unique()[:10])
+            output[table] = {
+                "rows": rows,
+                "unresolved_rows": unresolved,
+                "examples": sorted(examples)[:10],
+            }
+            unresolved_total += unresolved
+        output["unresolved_rows"] = unresolved_total
+        if unresolved_total and self.request.instrument_resolution_policy == "repair_or_fail":
+            raise DataContractError(
+                "Hermes extension referential preflight failed: "
+                + json.dumps(output, ensure_ascii=False)
+            )
+        return output
 
     def _build_special_treatment(self) -> None:
         """Transcribe the vendor's special-treatment state log into windows.
@@ -1877,7 +2155,9 @@ class HermesCanonicalizer:
                 )
                 instrument_id = instrument_id.fillna(fallback)
             source, instrument_id = _filter_known_extension_instruments(
-                source, instrument_id, mapping_quality
+                source, instrument_id, mapping_quality,
+                policy=self.request.instrument_resolution_policy,
+                source_table=source_table,
             )
             base = _daily_extension_base(
                 source, source_table, instrument_id
@@ -1951,7 +2231,9 @@ class HermesCanonicalizer:
                 self.instrument_by_security
             )
             source, instrument_id = _filter_known_extension_instruments(
-                source, instrument_id, mapping_quality
+                source, instrument_id, mapping_quality,
+                policy=self.request.instrument_resolution_policy,
+                source_table=source_table,
             )
             base = _daily_extension_base(
                 source, source_table, instrument_id
@@ -1995,7 +2277,9 @@ class HermesCanonicalizer:
                 self.instrument_by_symbol
             )
             source, instrument_id = _filter_known_extension_instruments(
-                source, instrument_id, mapping_quality
+                source, instrument_id, mapping_quality,
+                policy=self.request.instrument_resolution_policy,
+                source_table=source_table,
             )
             base = _daily_extension_base(
                 source, source_table, instrument_id

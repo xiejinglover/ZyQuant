@@ -1,7 +1,10 @@
 # Hermes 全量数据运行手册
 
 Hermes 是全量 A 股快照的唯一来源。采集过程只使用只读事务、服务端游标和
-启动时固定的 `UPDATE_TIME` 水位，不会向 Hermes 执行写操作。
+启动时固定的 `UPDATE_TIME` 水位，不会向 Hermes 执行写操作。证券主数据
+三表是例外：`md_security`、`md_sec_symbol`、`md_sec_chg` 作为一个很小的
+有效期数据单元完整读取，防止改名更新时间导致稳定证券身份从旧快照消失；
+其原始文件哈希和实际采用的名称有效期均进入 lineage。
 
 ## 凭据
 
@@ -34,6 +37,10 @@ include_money_flow: true
 include_limit_events: true
 include_margin: true
 include_intraday_factors: true
+# 生产默认值；孤儿证券必须先修复，否则禁止生成和发布快照。
+instrument_resolution_policy: repair_or_fail
+# 仅在需要审计修复时配置。
+security_master_repair_manifest: ./data/acquisitions/<job>/repairs/security_master_manifest.json
 limits:
   max_connections: 8
   target_memory_gib: 78
@@ -111,6 +118,12 @@ intraday = snapshot.table(
 )
 ```
 
+证券简称按快照 `end_date` 从 `md_sec_chg` 的 `0101` 有效区间解析，不使用
+`md_security` 当前简称覆盖历史。修复层只允许补充 raw 中缺失的证券，不允许
+覆盖已存在身份；清单中的 job、截止日、Parquet SHA-256、证券代码、交易所、
+历史简称及有效区间必须全部通过校验。`drop_with_quality` 仅供探查任务显式
+使用，生产快照必须保持 `repair_or_fail`。
+
 ## 发布
 
 `hermes-publish.yaml` 只需指定已完成的 job：
@@ -144,6 +157,9 @@ data/acquisitions/<job_id>/
 ├── state.sqlite
 ├── source_schema.json
 ├── raw/
+├── repairs/
+│   ├── security_master_manifest.json
+│   └── md_security.parquet
 ├── canonical/
 ├── quarantine/
 ├── logs/

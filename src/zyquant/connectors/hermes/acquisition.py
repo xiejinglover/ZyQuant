@@ -27,6 +27,8 @@ HERMES_SOURCE_TABLES = (
     "fdmt_main_data_q_pit",
     "fdmt_md_n_ttmp",
     "md_security",
+    "md_sec_symbol",
+    "md_sec_chg",
     "md_trade_cal",
     "mkt_equd",
     "mkt_equd_adj_af",
@@ -52,6 +54,7 @@ MONEY_FLOW_SOURCE_TABLES = ("mkt_equ_mf_new",)
 LIMIT_EVENT_SOURCE_TABLES = ("mkt_limit_ind",)
 MARGIN_SOURCE_TABLES = ("fst_detail",)
 INTRADAY_FACTOR_SOURCE_TABLES = ("equ_h2l_factor_t2",)
+SECURITY_MASTER_TABLES = {"md_security", "md_sec_symbol", "md_sec_chg"}
 OPTIONAL_HERMES_SOURCE_TABLES = (
     *MONEY_FLOW_SOURCE_TABLES,
     *LIMIT_EVENT_SOURCE_TABLES,
@@ -99,6 +102,8 @@ DIRECT_EXCHANGE_TABLES = {
     *STATEMENT_FINANCIAL_TABLES,
 }
 SECURITY_ID_TABLES = {
+    "md_sec_symbol",
+    "md_sec_chg",
     "mkt_equd",
     "mkt_equd_adj_af",
     "mkt_limit",
@@ -134,6 +139,8 @@ DATE_FILTERS = {
     # A name set long before the window is still the name in force inside it,
     # so take every change up to the end date rather than a bounded range.
     "equ_inst_sstate": "EFF_DATE <= %s",
+    "md_sec_symbol": "BEGIN_DATE <= %s",
+    "md_sec_chg": "BEGIN_DATE <= %s",
 }
 
 
@@ -208,6 +215,8 @@ class HermesAcquisitionRequest:
     include_limit_events: bool = False
     include_margin: bool = False
     include_intraday_factors: bool = False
+    instrument_resolution_policy: str = "repair_or_fail"
+    security_master_repair_manifest: Path | None = None
 
     def __post_init__(self) -> None:
         if self.start_date > self.end_date:
@@ -217,6 +226,13 @@ class HermesAcquisitionRequest:
         unknown = set(self.exchanges) - {"XSHG", "XSHE", "XBEI"}
         if unknown:
             raise ValueError(f"unsupported exchanges: {sorted(unknown)}")
+        if self.instrument_resolution_policy not in {
+            "repair_or_fail", "drop_with_quality",
+        }:
+            raise ValueError(
+                "instrument_resolution_policy must be repair_or_fail or "
+                "drop_with_quality"
+            )
 
     @property
     def job_root(self) -> Path:
@@ -309,6 +325,10 @@ class AcquisitionState:
         payload["financial_warmup_start"] = (
             request.financial_warmup_start.isoformat()
         )
+        # These options affect only canonicalization. Excluding them preserves
+        # resume compatibility with already-completed immutable raw jobs.
+        payload.pop("instrument_resolution_policy", None)
+        payload.pop("security_master_repair_manifest", None)
         # Keep default requests byte-compatible with jobs created before these
         # optional extension switches existed. Enabling one still changes the
         # durable request hash and therefore correctly requires a new job.
@@ -695,8 +715,14 @@ class HermesExtractionPlanner:
                 f"WHERE s.PARTY_ID={table}.PARTY_ID AND s.ASSET_CLASS='E' "
                 "AND s.EXCHANGE_CD IN ('XSHG','XSHE','XBEI'))"
             )
-        predicates.append("(UPDATE_TIME IS NULL OR UPDATE_TIME <= %s)")
-        parameters.append(self.watermark)
+        # Security-master rows are mutable current/effective-state records.
+        # Applying the watermark to the whole row can erase a long-lived
+        # identity or its historical name after a mere rename. Capture these
+        # small reference tables as a unit; their immutable raw hashes and the
+        # selected effective interval are recorded in snapshot lineage.
+        if table not in SECURITY_MASTER_TABLES:
+            predicates.append("(UPDATE_TIME IS NULL OR UPDATE_TIME <= %s)")
+            parameters.append(self.watermark)
         return predicates, parameters
 
     def _single(self, table: str) -> ExtractionChunk:
@@ -719,6 +745,7 @@ class HermesExtractionPlanner:
             elif table in {
                 "equ_shares_change", "equ_free_shares",
                 "md_inst_type", "md_type", "equ_inst_sstate",
+                "md_sec_symbol", "md_sec_chg",
             }:
                 parameters.append(self.request.end_date)
             else:
