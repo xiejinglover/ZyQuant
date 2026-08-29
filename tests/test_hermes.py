@@ -257,11 +257,34 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
         limit_source = pd.DataFrame([{
             **common,
             "SECURITY_ID": 2,
+            "TICKER_SYMBOL": "000001",
             "LIMIT_TYPE": "01",
             "FIRST_LIMIT_TIME": "09:40:00",
             "LAST_LIMIT_TIME": "14:30:00",
             **limit_values,
         }])
+        limit_source = pd.concat([
+            limit_source,
+            pd.DataFrame([{
+                **common,
+                "ID": 8,
+                "SECURITY_ID": 999,
+                "TICKER_SYMBOL": "000001",
+                "LIMIT_TYPE": "02",
+                "FIRST_LIMIT_TIME": "10:00:00",
+                "LAST_LIMIT_TIME": "14:00:00",
+                **limit_values,
+            }, {
+                **common,
+                "ID": 9,
+                "SECURITY_ID": 1000,
+                "TICKER_SYMBOL": "999999",
+                "LIMIT_TYPE": "01",
+                "FIRST_LIMIT_TIME": "10:00:00",
+                "LAST_LIMIT_TIME": "14:00:00",
+                **limit_values,
+            }]),
+        ], ignore_index=True)
         margin_source = pd.DataFrame([{
             **common,
             "SECURITY_ID": 2,
@@ -269,6 +292,15 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
                 MARGIN_SOURCE_FIELDS
             )},
         }])
+        margin_source = pd.concat([
+            margin_source,
+            pd.DataFrame([{
+                **common,
+                "ID": 8,
+                "SECURITY_ID": 999,
+                **{name: 0.0 for name in MARGIN_SOURCE_FIELDS},
+            }]),
+        ], ignore_index=True)
         factor_source = pd.DataFrame([{
             **common,
             "TICKER_SYMBOL": "000001",
@@ -276,6 +308,15 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
             "PV_CORR": None,
             "RV_CORR": -0.25,
         }])
+        factor_source = pd.concat([
+            factor_source,
+            pd.DataFrame([{
+                **common,
+                "ID": 8,
+                "TICKER_SYMBOL": "999999",
+                **{name: 0.0 for name in INTRADAY_FACTOR_SOURCE_FIELDS},
+            }]),
+        ], ignore_index=True)
         for table, frame in (
             ("mkt_limit_ind", limit_source),
             ("fst_detail", margin_source),
@@ -292,10 +333,14 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
         margin_quality = canonicalizer._build_margin()
         factor_quality = canonicalizer._build_intraday_factors()
 
-        limit = pd.read_parquet(
+        limit_frame = pd.read_parquet(
             canonicalizer.canonical / "daily_limit_events"
-        ).iloc[0]
+        )
+        limit = limit_frame[limit_frame["limit_type"].eq("up")].iloc[0]
         assert limit_quality["source_table"] == "mkt_limit_ind"
+        assert limit_quality["rows"] == 2
+        assert limit_quality["symbol_fallback_rows"] == 1
+        assert limit_quality["unknown_instrument_rows_dropped"] == 1
         assert limit["limit_type"] == "up"
         assert limit["source_limit_type_code"] == "01"
         assert limit["first_limit_time_seconds"] == 9 * 3600 + 40 * 60
@@ -307,6 +352,8 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
             canonicalizer.canonical / "daily_margin"
         ).iloc[0]
         assert margin_quality["source_table"] == "fst_detail"
+        assert margin_quality["rows"] == 1
+        assert margin_quality["unknown_instrument_rows_dropped"] == 1
         assert margin["financing_balance"] == pytest.approx(1.0)
         assert margin["margin_balance"] == pytest.approx(8.0)
         assert margin["available_at"] == date(2024, 1, 3)
@@ -315,6 +362,8 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
             canonicalizer.canonical / "daily_intraday_factors"
         ).iloc[0]
         assert factor_quality["source_table"] == "equ_h2l_factor_t2"
+        assert factor_quality["rows"] == 1
+        assert factor_quality["unknown_instrument_rows_dropped"] == 1
         assert pd.isna(factor["price_volume_corr"])
         assert factor["return_volume_corr"] == pytest.approx(-0.25)
         assert factor["available_at"] == date(2024, 1, 3)
