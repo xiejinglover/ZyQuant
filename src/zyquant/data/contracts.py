@@ -336,7 +336,11 @@ FIELD_SPECS: Final[dict[str, dict[str, FieldSpec]]] = {
             FLOAT, nullable=True, unit="CNY", minimum=0,
         ),
         "financing_repayment_value": FieldSpec(
-            FLOAT, nullable=True, unit="CNY", minimum=0,
+            FLOAT, nullable=True, unit="CNY",
+            description=(
+                "Signed repayment flow; Hermes uses negative values for "
+                "balance corrections"
+            ),
         ),
         "securities_lending_balance_volume": FieldSpec(
             FLOAT, nullable=True, unit="shares", minimum=0,
@@ -345,7 +349,11 @@ FIELD_SPECS: Final[dict[str, dict[str, FieldSpec]]] = {
             FLOAT, nullable=True, unit="shares", minimum=0,
         ),
         "securities_lending_repayment_volume": FieldSpec(
-            FLOAT, nullable=True, unit="shares", minimum=0,
+            FLOAT, nullable=True, unit="shares",
+            description=(
+                "Signed repayment flow; Hermes uses negative values for "
+                "balance corrections"
+            ),
         ),
         "securities_lending_balance_value": FieldSpec(
             FLOAT, nullable=True, unit="CNY", minimum=0,
