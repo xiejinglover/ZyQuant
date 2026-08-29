@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from datetime import date, timedelta
@@ -11,6 +12,7 @@ import pyarrow as pa
 import pytest
 
 from zyquant.core.exceptions import DataContractError
+from zyquant.core.hashing import hash_file
 from zyquant.data import AdjustmentProcessor
 from zyquant.connectors.hermes import request_from_mapping
 from zyquant.connectors.hermes.normalize import (
@@ -112,9 +114,14 @@ def test_planner_is_deterministic_and_read_only():
     assert first == second
     assert len({chunk.chunk_id for chunk in first}) == len(first)
     assert all(chunk.sql.lstrip().upper().startswith("SELECT") for chunk in first)
+    security_master = {"md_security", "md_sec_symbol", "md_sec_chg"}
+    assert all(
+        "UPDATE_TIME" not in chunk.sql
+        for chunk in first if chunk.table_name in security_master
+    )
     assert all(
         "UPDATE_TIME" in chunk.sql
-        for chunk in first
+        for chunk in first if chunk.table_name not in security_master
     )
     assert {
         chunk.table_name for chunk in first
@@ -244,6 +251,7 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
             include_limit_events=True,
             include_margin=True,
             include_intraday_factors=True,
+            instrument_resolution_policy="drop_with_quality",
         )
         relative = Path("year=2024/month=01/part-2024-01.parquet")
         common = {
@@ -367,6 +375,139 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
         assert pd.isna(factor["price_volume_corr"])
         assert factor["return_volume_corr"] == pytest.approx(-0.25)
         assert factor["available_at"] == date(2024, 1, 3)
+
+
+def test_security_master_repair_is_audited_and_history_is_as_of():
+    with tempfile.TemporaryDirectory() as directory:
+        request = HermesAcquisitionRequest(
+            job_id="repair-job", root=Path(directory),
+            end_date=date(2026, 7, 24),
+        )
+        raw = pd.DataFrame([{
+            "SECURITY_ID": 1, "TICKER_SYMBOL": "000001",
+            "EXCHANGE_CD": "XSHE", "SEC_SHORT_NAME": "平安银行",
+            "UPDATE_TIME": pd.Timestamp("2026-06-01"),
+        }])
+        overlay = pd.DataFrame([{
+            "SECURITY_ID": 1977, "TICKER_SYMBOL": "002058",
+            "EXCHANGE_CD": "XSHE", "SEC_SHORT_NAME": "威尔泰",
+            "UPDATE_TIME": pd.Timestamp("2026-06-15"),
+        }])
+        repair_root = request.job_root / "repairs"
+        repair_root.mkdir(parents=True)
+        overlay_path = repair_root / "md_security.parquet"
+        overlay.to_parquet(overlay_path, index=False)
+        manifest = {
+            "schema_version": "1", "job_id": request.job_id,
+            "as_of_date": "2026-07-24", "overlay": overlay_path.name,
+            "overlay_sha256": hash_file(overlay_path),
+            "parent_dataset": {"dataset_id": "v5", "fingerprint": "abc"},
+            "records": [{
+                "security_id": 1977, "instrument_id": "002058.XSHE",
+                "historical_name": "威尔泰", "effective_from": "2026-06-15",
+                "effective_to": "2026-08-27",
+                "reason": "mutable_master_overwritten_after_watermark",
+            }],
+        }
+        manifest_path = repair_root / "security_master_manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        changes = pd.DataFrame([{
+            "ID": 1, "SECURITY_ID": 1977, "SEC_INFO_TYPE": "0101",
+            "VALUE": "威尔泰", "BEGIN_DATE": date(2026, 6, 15),
+            "END_DATE": date(2026, 8, 27),
+            "UPDATE_TIME": pd.Timestamp("2026-08-27"),
+        }, {
+            "ID": 2, "SECURITY_ID": 1977, "SEC_INFO_TYPE": "0101",
+            "VALUE": "紫竹高科", "BEGIN_DATE": date(2026, 8, 28),
+            "END_DATE": None, "UPDATE_TIME": pd.Timestamp("2026-08-27"),
+        }])
+        history_path = request.job_root / "raw" / "md_sec_chg" / "part-all.parquet"
+        history_path.parent.mkdir(parents=True)
+        changes.to_parquet(history_path, index=False)
+        symbols = pd.DataFrame([{
+            "ID": 1, "SECURITY_ID": 1977, "MAP_SYMBOL": "002058",
+            "MAP_SYMBOL_EX_CD": "XSHE", "BEGIN_DATE": date(2006, 7, 20),
+            "END_DATE": None, "UPDATE_TIME": pd.Timestamp("2016-03-02"),
+        }])
+        symbol_path = request.job_root / "raw" / "md_sec_symbol" / "part-all.parquet"
+        symbol_path.parent.mkdir(parents=True)
+        symbols.to_parquet(symbol_path, index=False)
+
+        canonicalizer = HermesCanonicalizer(request)
+        repaired, quality = canonicalizer._apply_security_master_repair(raw)
+        resolved, history = canonicalizer._resolve_historical_names(repaired)
+        row = resolved.loc[resolved["SECURITY_ID"].eq(1977)].iloc[0]
+        assert row["SEC_SHORT_NAME"] == "威尔泰"
+        assert quality["repair_rows"] == 1
+        assert quality["repair_manifest_sha256"] == hash_file(manifest_path)
+        assert history["historical_names_resolved"] == 1
+
+        later = HermesCanonicalizer(HermesAcquisitionRequest(
+            job_id="repair-job", root=Path(directory),
+            end_date=date(2026, 8, 28),
+        ))
+        later_resolved, _ = later._resolve_historical_names(repaired)
+        assert later_resolved.loc[
+            later_resolved["SECURITY_ID"].eq(1977), "SEC_SHORT_NAME"
+        ].iloc[0] == "紫竹高科"
+
+
+def test_security_master_repair_rejects_hash_and_identity_conflicts():
+    with tempfile.TemporaryDirectory() as directory:
+        request = HermesAcquisitionRequest(
+            job_id="repair-conflict", root=Path(directory),
+            end_date=date(2026, 7, 24),
+        )
+        raw = pd.DataFrame([{
+            "SECURITY_ID": 1977, "TICKER_SYMBOL": "002058",
+            "EXCHANGE_CD": "XSHE", "SEC_SHORT_NAME": "威尔泰",
+            "UPDATE_TIME": pd.Timestamp("2026-06-15"),
+        }])
+        repair_root = request.job_root / "repairs"
+        repair_root.mkdir(parents=True)
+        overlay = repair_root / "md_security.parquet"
+        raw.to_parquet(overlay, index=False)
+        manifest = {
+            "schema_version": "1", "job_id": request.job_id,
+            "as_of_date": "2026-07-24", "overlay": overlay.name,
+            "overlay_sha256": "bad-hash", "records": [],
+        }
+        path = repair_root / "security_master_manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        canonicalizer = HermesCanonicalizer(request)
+        with pytest.raises(DataContractError, match="hash mismatch"):
+            canonicalizer._apply_security_master_repair(raw.iloc[0:0])
+        manifest["overlay_sha256"] = hash_file(overlay)
+        manifest["records"] = [{
+            "security_id": 1977, "instrument_id": "002058.XSHE",
+            "historical_name": "威尔泰", "effective_from": "2026-06-15",
+            "effective_to": "2026-08-27",
+        }]
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(DataContractError, match="overwrite raw identities"):
+            canonicalizer._apply_security_master_repair(raw)
+
+
+def test_strict_instrument_resolution_is_default_and_drop_is_explicit():
+    default = request_from_mapping({})
+    assert default.instrument_resolution_policy == "repair_or_fail"
+    with tempfile.TemporaryDirectory() as directory:
+        request = HermesAcquisitionRequest(
+            job_id="strict-extension", root=Path(directory),
+            start_date=date(2024, 1, 1), end_date=date(2024, 1, 31),
+            include_margin=True,
+        )
+        source = pd.DataFrame([{
+            "ID": 1, "TRADE_DATE": date(2024, 1, 2),
+            "SECURITY_ID": 999, "UPDATE_TIME": pd.Timestamp("2024-01-02"),
+            **{name: 0.0 for name in MARGIN_SOURCE_FIELDS},
+        }])
+        target = request.job_root / "raw" / "fst_detail" / "part.parquet"
+        target.parent.mkdir(parents=True)
+        source.to_parquet(target, index=False)
+        canonicalizer = HermesCanonicalizer(request)
+        with pytest.raises(DataContractError, match="unresolved instrument"):
+            canonicalizer._build_margin()
 
 
 def test_hermes_bit_columns_are_preserved_as_binary():
