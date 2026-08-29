@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import date
+from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
@@ -11,11 +13,32 @@ from zyquant.data import (
     AdjustmentProcessor, DirectoryDataAdapter, ParquetDataProvider,
     SnapshotPublisher,
 )
+from zyquant.data.snapshot import _open_partitioned_dataset
 
 from tests.support import CODE_A, canonical_tables
 
 
 class DataTests(unittest.TestCase):
+    def test_partition_reader_uses_nonempty_schema_authority(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            empty = root / "year=2010" / "month=01"
+            populated = root / "year=2010" / "month=02"
+            empty.mkdir(parents=True)
+            populated.mkdir(parents=True)
+            pd.DataFrame(columns=["trade_date", "instrument_id"]).to_parquet(
+                empty / "part.parquet", index=False
+            )
+            pd.DataFrame({
+                "trade_date": [date(2010, 2, 1)],
+                "instrument_id": [CODE_A],
+            }).to_parquet(populated / "part.parquet", index=False)
+
+            result = _open_partitioned_dataset(root).to_table().to_pandas()
+
+            self.assertEqual(result["trade_date"].tolist(), [date(2010, 2, 1)])
+            self.assertEqual(result["instrument_id"].tolist(), [CODE_A])
+
     @staticmethod
     def _money_flow(days):
         return pd.DataFrame([
