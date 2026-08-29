@@ -325,6 +325,11 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
                 "ID": 8,
                 "TICKER_SYMBOL": "999999",
                 **{name: 0.0 for name in INTRADAY_FACTOR_SOURCE_FIELDS},
+            }, {
+                **common,
+                "ID": 9,
+                "TICKER_SYMBOL": "000043",
+                **{name: 0.2 for name in INTRADAY_FACTOR_SOURCE_FIELDS},
             }]),
         ], ignore_index=True)
         for table, frame in (
@@ -338,7 +343,12 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
 
         canonicalizer = HermesCanonicalizer(request)
         canonicalizer.instrument_by_security = {2: "000001.XSHE"}
-        canonicalizer.instrument_by_symbol = {"000001": "000001.XSHE"}
+        canonicalizer.instrument_by_symbol = {
+            "000001": "000001.XSHE", "000043": "001914.XSHE",
+        }
+        canonicalizer.superseded_symbol_aliases = {
+            "000043": "001914.XSHE",
+        }
         limit_quality = canonicalizer._build_limit_events()
         margin_quality = canonicalizer._build_margin()
         factor_quality = canonicalizer._build_intraday_factors()
@@ -372,12 +382,15 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
         assert margin["margin_balance"] == pytest.approx(8.0)
         assert margin["available_at"] == date(2024, 1, 3)
 
-        factor = pd.read_parquet(
+        factor_frame = pd.read_parquet(
             canonicalizer.canonical / "daily_intraday_factors"
-        ).iloc[0]
+        )
+        factor = factor_frame.iloc[0]
         assert factor_quality["source_table"] == "equ_h2l_factor_t2"
-        assert factor_quality["rows"] == 1
+        assert factor_quality["rows"] == 2
+        assert factor_quality["superseded_symbol_alias_rows"] == 1
         assert factor_quality["unknown_instrument_rows_dropped"] == 1
+        assert "001914.XSHE" in set(factor_frame["instrument_id"])
         assert pd.isna(factor["price_volume_corr"])
         assert factor["return_volume_corr"] == pytest.approx(-0.25)
         assert factor["available_at"] == date(2024, 1, 3)
@@ -704,6 +717,10 @@ def test_recoded_ticker_without_market_data_is_excluded_and_recorded():
         excluded = canonicalizer.superseded_aliases[0]
         assert excluded["security_id"] == 77481
         assert excluded["reason"] == "no_market_data_in_window"
+        assert excluded["mapped_to"] == "001914.XSHE"
+        assert canonicalizer.superseded_symbol_aliases == {
+            "000043": "001914.XSHE",
+        }
 
 
 def test_relisting_sharing_a_party_id_is_never_excluded():
