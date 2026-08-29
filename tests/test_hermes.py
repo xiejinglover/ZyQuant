@@ -18,7 +18,7 @@ from zyquant.connectors.hermes import request_from_mapping
 from zyquant.connectors.hermes.normalize import (
     INTRADAY_FACTOR_SOURCE_FIELDS, LIMIT_EVENT_SOURCE_FIELDS,
     MARGIN_SOURCE_FIELDS, MONEY_FLOW_SOURCE_FIELDS, HermesCanonicalizer,
-    _cumulative_flow_rows, _direct_metric_rows,
+    _cumulative_flow_rows, _dataset_payload_columns, _direct_metric_rows,
 )
 from zyquant.connectors.hermes.acquisition import (
     HERMES_SOURCE_TABLES,
@@ -98,6 +98,20 @@ def test_credentials_are_environment_only_and_redacted():
     with patch.dict(os.environ, {}, clear=True):
         with pytest.raises(DataContractError, match="HERMES_MYSQL_HOST"):
             HermesCredentials.from_env()
+
+
+def test_dataset_payload_columns_excludes_hive_partitions(tmp_path):
+    partition = tmp_path / "year=2026" / "month=07"
+    partition.mkdir(parents=True)
+    pd.DataFrame({
+        "trade_date": [date(2026, 7, 24)],
+        "instrument_id": ["002058.XSHE"],
+        "value": [1.0],
+    }).to_parquet(partition / "part.parquet", index=False)
+
+    assert _dataset_payload_columns(tmp_path) == {
+        "trade_date", "instrument_id", "value",
+    }
 
 
 def test_planner_is_deterministic_and_read_only():
