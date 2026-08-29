@@ -299,6 +299,8 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
             **{name: float(index + 1) for index, name in enumerate(
                 MARGIN_SOURCE_FIELDS
             )},
+            "FIN_REFUND_VAL": -5.0,
+            "SEC_REFUND_VOL": -2.0,
         }])
         margin_source = pd.concat([
             margin_source,
@@ -363,6 +365,10 @@ def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
         assert margin_quality["rows"] == 1
         assert margin_quality["unknown_instrument_rows_dropped"] == 1
         assert margin["financing_balance"] == pytest.approx(1.0)
+        assert margin["financing_repayment_value"] == pytest.approx(-5.0)
+        assert margin[
+            "securities_lending_repayment_volume"
+        ] == pytest.approx(-2.0)
         assert margin["margin_balance"] == pytest.approx(8.0)
         assert margin["available_at"] == date(2024, 1, 3)
 
