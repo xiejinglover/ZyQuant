@@ -202,6 +202,13 @@ def _write(
     return destination
 
 
+def _dataset_payload_columns(table_path: Path) -> set[str]:
+    """Return stored columns, excluding virtual Hive partition columns."""
+    dataset = pads.dataset(table_path, format="parquet", partitioning="hive")
+    partition_columns = set(dataset.partitioning.schema.names)
+    return set(dataset.schema.names) - partition_columns
+
+
 def _instrument_id(frame: pd.DataFrame) -> pd.Series:
     return (
         frame["TICKER_SYMBOL"].astype(str)
@@ -2478,10 +2485,7 @@ class HermesAcquisitionPublisher:
                     }
                     files.append(record)
                     table_files.append(record["path"])
-                dataset = pads.dataset(
-                    table_path, format="parquet", partitioning="hive"
-                )
-                actual = set(dataset.schema.names)
+                actual = _dataset_payload_columns(table_path)
                 unknown_columns = actual - set(FIELD_SPECS[name])
                 missing_columns = set(REQUIRED_COLUMNS[name]) - actual
                 if unknown_columns or missing_columns:
