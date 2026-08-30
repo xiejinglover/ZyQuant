@@ -230,10 +230,10 @@ def test_money_flow_mapper_preserves_null_zero_and_local_visibility_date():
         source_values = {name: 0.0 for name in MONEY_FLOW_SOURCE_FIELDS}
         source_values.update({
             "INFLOW": 100.0,
-            "OUTFLOW": 40.0,
+            "OUTFLOW": -40.0,
             "NET_FLOW": 60.0,
             "INFLOW_S": None,
-            "OUTFLOW_S": 0.0,
+            "OUTFLOW_S": -12.5,
             "NET_FLOW_S": None,
         })
         source = pd.DataFrame([{
@@ -260,8 +260,10 @@ def test_money_flow_mapper_preserves_null_zero_and_local_visibility_date():
         assert metadata["rows"] == 1
         assert frame.iloc[0]["available_at"] == date(2024, 1, 3)
         assert pd.isna(frame.iloc[0]["inflow_s"])
-        assert frame.iloc[0]["outflow_s"] == 0.0
+        assert frame.iloc[0]["outflow"] == 40.0
+        assert frame.iloc[0]["outflow_s"] == 12.5
         assert frame.iloc[0]["source_batch_id"] == "money-flow-job"
+        assert metadata["signed_outflow_normalization"] == "abs(Hermes OUTFLOW*)"
 
 
 def test_strategy_extension_mappers_preserve_pit_and_source_semantics():
@@ -492,6 +494,84 @@ def test_security_master_repair_is_audited_and_history_is_as_of():
         assert later_resolved.loc[
             later_resolved["SECURITY_ID"].eq(1977), "SEC_SHORT_NAME"
         ].iloc[0] == "紫竹高科"
+
+
+def test_security_master_repair_accepts_hashed_current_identity_evidence():
+    with tempfile.TemporaryDirectory() as directory:
+        request = HermesAcquisitionRequest(
+            job_id="repair-current-identity", root=Path(directory),
+            end_date=date(2026, 7, 24),
+        )
+        columns = {
+            "ASSET_CLASS": "E", "TRANS_CURR_CD": "CNY",
+            "LIST_DATE": date(1996, 11, 11), "DELIST_DATE": None,
+        }
+        raw = pd.DataFrame([{
+            "SECURITY_ID": 1, "TICKER_SYMBOL": "000001",
+            "EXCHANGE_CD": "XSHE", "SEC_SHORT_NAME": "平安银行",
+            "UPDATE_TIME": pd.Timestamp("2026-06-01"), **columns,
+        }])
+        overlay = pd.DataFrame([{
+            "SECURITY_ID": 1415, "TICKER_SYMBOL": "600768",
+            "EXCHANGE_CD": "XSHG", "SEC_SHORT_NAME": "宁波富邦",
+            "UPDATE_TIME": pd.Timestamp("2026-08-18"), **columns,
+        }])
+        current = overlay.copy()
+        current["SEC_SHORT_NAME"] = "富邦新材"
+        repair_root = request.job_root / "repairs"
+        repair_root.mkdir(parents=True)
+        overlay_path = repair_root / "md_security.parquet"
+        current_path = repair_root / "md_security_current_evidence.parquet"
+        overlay.to_parquet(overlay_path, index=False)
+        current.to_parquet(current_path, index=False)
+        manifest = {
+            "schema_version": "1", "job_id": request.job_id,
+            "as_of_date": "2026-07-24", "overlay": overlay_path.name,
+            "overlay_sha256": hash_file(overlay_path),
+            "identity_evidence": current_path.name,
+            "identity_evidence_sha256": hash_file(current_path),
+            "identity_evidence_source": "Hermes.md_security",
+            "parent_dataset": {"dataset_id": "v5", "fingerprint": "abc"},
+            "records": [{
+                "security_id": 1415, "instrument_id": "600768.XSHG",
+                "historical_name": "宁波富邦",
+                "effective_from": "2006-12-26",
+                "effective_to": "2026-08-17",
+                "reason": "mutable_master_overwritten_after_watermark",
+            }],
+        }
+        manifest_path = repair_root / "security_master_manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        changes = pd.DataFrame([{
+            "ID": 1, "SECURITY_ID": 1415, "SEC_INFO_TYPE": "0101",
+            "VALUE": "宁波富邦", "BEGIN_DATE": date(2006, 12, 26),
+            "END_DATE": date(2026, 8, 17),
+            "UPDATE_TIME": pd.Timestamp("2026-08-12"),
+        }])
+        history_path = request.job_root / "raw" / "md_sec_chg" / "part-all.parquet"
+        history_path.parent.mkdir(parents=True)
+        changes.to_parquet(history_path, index=False)
+        symbols = pd.DataFrame([{
+            "ID": 1, "SECURITY_ID": 1415, "MAP_SYMBOL": "730768",
+            "MAP_SYMBOL_EX_CD": "XSHG", "BEGIN_DATE": date(1996, 10, 28),
+            "END_DATE": None, "UPDATE_TIME": pd.Timestamp("2016-03-02"),
+        }])
+        symbol_path = request.job_root / "raw" / "md_sec_symbol" / "part-all.parquet"
+        symbol_path.parent.mkdir(parents=True)
+        symbols.to_parquet(symbol_path, index=False)
+
+        repaired, quality = HermesCanonicalizer(
+            request
+        )._apply_security_master_repair(raw)
+        row = repaired.loc[repaired["SECURITY_ID"].eq(1415)].iloc[0]
+        assert row["TICKER_SYMBOL"] == "600768"
+        assert quality["identity_evidence_sha256"] == hash_file(current_path)
+        assert quality["identity_evidence_source"] == "Hermes.md_security"
+
+        manifest["identity_evidence_sha256"] = "bad-hash"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(DataContractError, match="identity evidence hash mismatch"):
+            HermesCanonicalizer(request)._apply_security_master_repair(raw)
 
 
 def test_security_master_repair_rejects_hash_and_identity_conflicts():

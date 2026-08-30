@@ -872,7 +872,9 @@ class HermesCanonicalizer:
                 raise DataContractError(
                     f"security-master repair name is not effective for {security_id}"
                 )
-        self._validate_repair_evidence(repaired, records_by_id)
+        evidence_quality = self._validate_repair_evidence(
+            repaired, records_by_id, manifest, manifest_path,
+        )
         combined = pd.concat([source, repaired[source.columns]], ignore_index=True)
         return combined, {
             "repair_rows": len(repaired),
@@ -880,13 +882,16 @@ class HermesCanonicalizer:
             "repair_manifest_sha256": hash_file(manifest_path),
             "repair_overlay_sha256": expected_hash,
             "parent_dataset": manifest.get("parent_dataset"),
+            **evidence_quality,
         }
 
     def _validate_repair_evidence(
         self,
         repaired: pd.DataFrame,
         records_by_id: Mapping[int, Mapping[str, Any]],
-    ) -> None:
+        manifest: Mapping[str, Any],
+        manifest_path: Path,
+    ) -> dict[str, Any]:
         symbol_path = self.raw / "md_sec_symbol" / "part-all.parquet"
         change_path = self.raw / "md_sec_chg" / "part-all.parquet"
         if not symbol_path.exists() or not change_path.exists():
@@ -914,6 +919,47 @@ class HermesCanonicalizer:
             frame["END_DATE"] = pd.to_datetime(
                 frame["END_DATE"], errors="coerce"
             )
+        identity_evidence: pd.DataFrame | None = None
+        identity_evidence_path: Path | None = None
+        identity_evidence_hash: str | None = None
+        evidence_value = manifest.get("identity_evidence")
+        if evidence_value:
+            identity_evidence_path = (
+                manifest_path.parent / str(evidence_value)
+            ).resolve()
+            if not identity_evidence_path.is_relative_to(
+                manifest_path.parent.resolve()
+            ):
+                raise DataContractError(
+                    "security-master identity evidence escapes its directory"
+                )
+            identity_evidence_hash = str(
+                manifest.get("identity_evidence_sha256", "")
+            )
+            if (
+                not identity_evidence_path.is_file()
+                or hash_file(identity_evidence_path) != identity_evidence_hash
+            ):
+                raise DataContractError(
+                    "security-master identity evidence hash mismatch"
+                )
+            if manifest.get("identity_evidence_source") != "Hermes.md_security":
+                raise DataContractError(
+                    "security-master identity evidence source is unsupported"
+                )
+            identity_evidence = _read(identity_evidence_path)
+            identity_required = {
+                "SECURITY_ID", "TICKER_SYMBOL", "EXCHANGE_CD", "ASSET_CLASS",
+                "TRANS_CURR_CD", "LIST_DATE", "DELIST_DATE", "UPDATE_TIME",
+            }
+            if identity_required - set(identity_evidence.columns):
+                raise DataContractError(
+                    "security-master identity evidence schema is incomplete"
+                )
+            if identity_evidence["SECURITY_ID"].duplicated().any():
+                raise DataContractError(
+                    "security-master identity evidence ids must be unique"
+                )
         as_of = pd.Timestamp(self.request.end_date)
         for row in repaired.itertuples(index=False):
             security_id = int(row.SECURITY_ID)
@@ -926,9 +972,38 @@ class HermesCanonicalizer:
                 & symbols["MAP_SYMBOL_EX_CD"].astype(str).eq(str(row.EXCHANGE_CD))
             ]
             if active_symbol.empty:
-                raise DataContractError(
-                    f"md_sec_symbol does not support repaired identity {security_id}"
+                if identity_evidence is None:
+                    raise DataContractError(
+                        "md_sec_symbol does not support repaired identity "
+                        f"{security_id} and no audited md_security evidence was supplied"
+                    )
+                current = identity_evidence[
+                    identity_evidence["SECURITY_ID"].eq(security_id)
+                ]
+                current = current[
+                    current["TICKER_SYMBOL"].astype(str).eq(
+                        str(row.TICKER_SYMBOL)
+                    )
+                    & current["EXCHANGE_CD"].astype(str).eq(
+                        str(row.EXCHANGE_CD)
+                    )
+                    & current["ASSET_CLASS"].astype(str).eq("E")
+                    & current["TRANS_CURR_CD"].astype(str).eq("CNY")
+                ]
+                listed = pd.to_datetime(
+                    current["LIST_DATE"], errors="coerce"
+                ).le(as_of)
+                delisted = pd.to_datetime(
+                    current["DELIST_DATE"], errors="coerce"
                 )
+                current = current[
+                    listed & (delisted.isna() | delisted.ge(as_of))
+                ]
+                if current.empty or current["UPDATE_TIME"].isna().any():
+                    raise DataContractError(
+                        "audited md_security evidence does not support repaired "
+                        f"identity {security_id}"
+                    )
             record = records_by_id[security_id]
             active_name = changes[
                 changes["SECURITY_ID"].eq(security_id)
@@ -942,6 +1017,16 @@ class HermesCanonicalizer:
                 raise DataContractError(
                     f"md_sec_chg does not support repaired name {security_id}"
                 )
+        return {
+            "identity_evidence": (
+                str(identity_evidence_path)
+                if identity_evidence_path is not None else None
+            ),
+            "identity_evidence_sha256": identity_evidence_hash,
+            "identity_evidence_source": (
+                "Hermes.md_security" if identity_evidence is not None else None
+            ),
+        }
 
     def _resolve_historical_names(
         self, source: pd.DataFrame,
@@ -2038,6 +2123,14 @@ class HermesCanonicalizer:
                     raise DataContractError(
                         f"mkt_equ_mf_new.{source_name} contains non-numeric values"
                     )
+                # Hermes stores OUTFLOW and its size buckets as signed cash
+                # movements. The canonical contract represents inflow and
+                # outflow as non-negative magnitudes; NET_FLOW remains signed.
+                if (
+                    source_name == "OUTFLOW"
+                    or source_name.startswith("OUTFLOW_")
+                ):
+                    numeric = numeric.abs()
                 values[canonical_name] = numeric.astype(float)
 
             if "ID" in source:
@@ -2088,6 +2181,7 @@ class HermesCanonicalizer:
             "start_date": minimum_date.isoformat() if minimum_date else None,
             "end_date": maximum_date.isoformat() if maximum_date else None,
             "fields": sorted(FIELD_SPECS["daily_money_flow"]),
+            "signed_outflow_normalization": "abs(Hermes OUTFLOW*)",
         }
 
     def _build_daily_extension(
