@@ -12,7 +12,7 @@ import pandas as pd
 
 from zyquant.analysis import write_html_report
 from zyquant.backtest import BacktestEngine, BacktestResult, StrategyBinding
-from zyquant.config import ResolvedRunConfig, load_config
+from zyquant.config import ResolvedRunConfig, load_config, resolve_project_path
 from zyquant.core import environment_metadata, git_metadata, plugins
 from zyquant.core.hashing import hash_payload
 from zyquant.core.versioning import (
@@ -29,9 +29,12 @@ class WorkflowRunner:
         output_root: str | Path,
         experiment_store: ExperimentStore | None = None,
         project_root: str | Path | None = None,
+        *,
+        create_output_root: bool = True,
     ):
         self.output_root = Path(output_root).expanduser().resolve()
-        self.output_root.mkdir(parents=True, exist_ok=True)
+        if create_output_root:
+            self.output_root.mkdir(parents=True, exist_ok=True)
         self.store = experiment_store
         self.project_root = Path(project_root or Path.cwd()).expanduser().resolve()
 
@@ -45,7 +48,7 @@ class WorkflowRunner:
             resolved.data.dataset_id, resolved.data.verify_hashes
         )
         factor_engine = FactorEngine(
-            resolved.factor.cache_root,
+            resolve_project_path(resolved.factor.cache_root, self.project_root),
             resolved.factor.lock_timeout_seconds,
             resolved.factor.cache_policy,
         )
@@ -106,7 +109,7 @@ class WorkflowRunner:
             config.data.dataset_id, config.data.verify_hashes
         )
         engine = FactorEngine(
-            config.factor.cache_root,
+            resolve_project_path(config.factor.cache_root, self.project_root),
             config.factor.lock_timeout_seconds,
             config.factor.cache_policy,
         )
@@ -431,6 +434,10 @@ class WorkflowRunner:
         if not bindings:
             raise ValueError("configuration must declare at least one strategy plugin")
         return bindings
+
+    def strategy_bindings(self, config: ResolvedRunConfig) -> list[StrategyBinding]:
+        """Resolve configured strategies without starting a run."""
+        return self._strategy_bindings(config)
 
     def _extension(
         self, kind, reference, parameters, **injected,

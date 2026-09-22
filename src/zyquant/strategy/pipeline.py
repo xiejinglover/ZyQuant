@@ -26,6 +26,11 @@ class PipelineStrategy:
     no_candidate_policy: str = "hold_previous"
     constraint_failure_policy: str = "fail"
 
+    @staticmethod
+    def factor_requirements():
+        """The built-in pipeline consumes signals, not FactorEngine factors."""
+        return {}
+
     def decide(self, context: StrategyContext) -> StrategyDecision:
         universe = self.universe_selector.select(context)
         bound = replace(context, universe=universe)
@@ -148,6 +153,10 @@ class DirectTargetStrategy:
     target_generator: Callable[[StrategyContext], CandidateWeights]
     universe_selector: UniverseSelector
     constraint_engine: ConstraintPolicy
+
+    @staticmethod
+    def factor_requirements():
+        return {}
 
     def decide(self, context: StrategyContext) -> StrategyDecision:
         universe = self.universe_selector.select(context)

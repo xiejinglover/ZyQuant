@@ -1,6 +1,6 @@
 from .base import (
-    BaseFactor, FactorContext, FactorDefinition, FactorResult, FactorService,
-    FactorView,
+    BaseFactor, FactorContext, FactorDefinition, FactorRequirementProvider,
+    FactorResult, FactorService, FactorView,
 )
 from .builtin import CompositeFactor, MomentumFactor, ReturnFactor, RollingAmountFactor
 from .cn_equity import (
@@ -23,7 +23,8 @@ from .engine import FactorEngine
 
 __all__ = [
     "BaseFactor", "CompositeFactor", "FactorContext", "FactorDefinition",
-    "FactorEngine", "FactorResult", "FactorService", "FactorView",
+    "FactorEngine", "FactorRequirementProvider", "FactorResult",
+    "FactorService", "FactorView",
     "MomentumFactor", "ReturnFactor", "RollingAmountFactor",
     "AssetGrowthFactor", "DividendContinuityFactor", "DividendCredibilityFactor", "DividendFundingFactor",
     "DividendYieldFactor", "DividendYieldHistoryFactor", "MetricFactor",

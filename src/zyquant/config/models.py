@@ -37,7 +37,9 @@ class FactorConfig(StrictModel):
     cache_root: Path = Path(".zyquant/cache/factors")
     factors: tuple[Mapping[str, Any], ...] = ()
     lock_timeout_seconds: float = Field(default=120.0, gt=0)
-    cache_policy: Literal["compute", "require"] = "compute"
+    # Formal runs are read-only by default. Development and cache-preparation
+    # jobs must opt in to materialisation explicitly.
+    cache_policy: Literal["compute", "require"] = "require"
     strict_quality: bool = True
 
 
@@ -225,3 +227,11 @@ def load_config(value: str | Path | Mapping[str, Any] | ResolvedRunConfig) -> Re
     if isinstance(value, (str, Path)):
         return ResolvedRunConfig.from_yaml(value)
     return ResolvedRunConfig.model_validate(value)
+
+
+def resolve_project_path(path: str | Path, project_root: str | Path) -> Path:
+    """Resolve portable configuration paths against the declared project root."""
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (Path(project_root).expanduser().resolve() / candidate).resolve()
