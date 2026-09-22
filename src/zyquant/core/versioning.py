@@ -12,7 +12,7 @@ from typing import Iterable
 
 from .hashing import hash_file, hash_payload
 
-FRAMEWORK_VERSION = "2.0.10"
+FRAMEWORK_VERSION = "2.0.11"
 SNAPSHOT_SCHEMA_VERSION = "1.0"
 LEDGER_SCHEMA_VERSION = "1.1"
 RUN_SCHEMA_VERSION = "1.0"
