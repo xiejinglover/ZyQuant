@@ -226,6 +226,31 @@ def test_require_policy_applies_to_compute_too(world):
         assert not cache.exists()
 
 
+def test_require_policy_does_not_upgrade_legacy_metadata(world):
+    snapshot, days = world
+    start, end = days[5], days[-1]
+    with tempfile.TemporaryDirectory() as cache:
+        FactorEngine(cache, cache_policy="compute").compute(
+            _Probe(), snapshot, start, end, None, end,
+        )
+        [entry] = _entries(cache, snapshot, "policy_probe")
+        metadata = json.loads(entry.read_text(encoding="utf-8"))
+        for key in (
+            "definition_key", "source_key", "instruments", "dataset_id",
+            "factor_version", "created_at",
+        ):
+            metadata.pop(key, None)
+        metadata["schema_version"] = "1.0"
+        entry.write_text(json.dumps(metadata), encoding="utf-8")
+        before = entry.read_bytes()
+
+        result = FactorEngine(cache, cache_policy="require").compute(
+            _Probe(), snapshot, start, end, None, end,
+        )
+        assert result.from_cache
+        assert entry.read_bytes() == before
+
+
 def test_sparse_view_filters_instruments_without_changing_cache_identity(world):
     snapshot, days = world
     start, end = days[5], days[-1]

@@ -51,7 +51,7 @@ class V1ContractTests(unittest.TestCase):
             )
             self.assertEqual(len(config.fingerprint), 64)
             self.assertFalse(config.analysis.attribution)
-            self.assertEqual(config.factor.cache_policy, "compute")
+            self.assertEqual(config.factor.cache_policy, "require")
             self.assertEqual(config.redacted()["metadata"]["api_token"], "***REDACTED***")
             with self.assertRaises(ValidationError):
                 ResolvedRunConfig.model_validate({

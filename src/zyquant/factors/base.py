@@ -279,3 +279,13 @@ class BaseFactor(ABC):
         dependencies: Mapping[str, pd.DataFrame],
     ) -> pd.DataFrame:
         """Return trade_date, instrument_id and value columns."""
+
+
+class FactorRequirementProvider(Protocol):
+    """Optional declaration implemented by new factor-consuming strategies.
+
+    The method must be pure: it declares factor objects but must not read a
+    snapshot, compute a factor, or mutate strategy state.
+    """
+
+    def factor_requirements(self) -> Mapping[str, BaseFactor]: ...

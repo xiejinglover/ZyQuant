@@ -104,6 +104,11 @@ strategy:
 zyq backtest run --project-root . --config config.yaml
 ```
 
+新策略的正式运行应先用 `zyq factors prepare` 在项目内的
+`.zyquant/cache/factors` 预热因子，再用 `zyq factors verify` 只读验证；
+回测配置使用 `factor.cache_policy: require`。完整步骤见
+[研究运行 SOP](docs/research-workflow.md)。
+
 ## 文档
 
 - [总体架构](docs/architecture.md)
@@ -114,6 +119,7 @@ zyq backtest run --project-root . --config config.yaml
 - [标准账本契约](docs/ledger-contract.md)
 - [Hermes 全量数据运行手册](docs/hermes-acquisition.md)
 - [因子层指南](docs/factor-guide.md)
+- [研究运行 SOP](docs/research-workflow.md)
 - [问题与踩坑记录](docs/issue-log.md)
 
 ## 开源许可

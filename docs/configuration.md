@@ -14,6 +14,8 @@ zyq data publish \
   --dataset-id cn-demo-v1
 zyq data validate --root ./data --dataset-id cn-demo-v1
 zyq config validate --config examples/v1_config.yaml
+zyq factors prepare --project-root . --config examples/v1_config.yaml
+zyq factors verify --project-root . --config examples/v1_config.yaml
 zyq backtest run --project-root . --config examples/v1_config.yaml
 zyq runs list --database runs/experiments.sqlite
 ```
@@ -47,7 +49,14 @@ zyq runs list --database runs/experiments.sqlite
 退市板块行情；正常停牌必须由 `paused: true` bar 表示，未退市持仓
 完全缺 bar 仍视为数据错误。
 
-因子缓存默认使用 `factor.cache_policy: compute`：命中即读、缺失时计算并原子
-发布。正式实验应显式改为 `require`，此时缓存缺失会在因子消费阶段立即失败且
-不产生任何缓存文件。策略可通过 `FactorEngine.load_view(..., dates=...)` 从
-全市场权威缓存稀疏读取决策日；这些日期只影响读取视图，不产生新的 cache key。
+因子缓存默认使用 `factor.cache_policy: require`：正式回测只读已发布
+缓存，缺失时立即失败且不写文件。开发或预热任务要计算缓存时，
+必须显式使用 `compute`。缓存逻辑根目录为 `.zyquant/cache/factors`，
+相对 `--project-root` 解析，而不是相对当前 shell 目录。
+
+权威生产快照的新因子缓存使用 `data.cutoff: 2026-07-24`、
+`instruments=None` 和连续全历史区间。正式基线回测可以在 `2026-06-01`
+结束，它只从更宽缓存中切片。策略可通过
+`FactorEngine.load_view(..., dates=...)` 稀疏读取决策日；`dates` 只影响
+返回视图，不产生新 cache key。统一 CLI 第一阶段面向实现
+`factor_requirements()` 的新策略；旧策略继续使用原有预热脚本。

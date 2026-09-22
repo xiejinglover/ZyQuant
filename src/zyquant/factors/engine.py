@@ -244,14 +244,16 @@ class FactorEngine:
             "factor_version": factor.version,
         }
         if entry is not None:
-            self._upgrade_metadata(entry.metadata_path, provenance)
+            if self.cache_policy == "compute":
+                self._upgrade_metadata(entry.metadata_path, provenance)
             return entry, True
         if self.cache_policy == "require":
             raise FactorCacheMiss(
                 "required factor cache is missing: "
                 f"factor={factor.name} start={start} end={end} "
                 f"cutoff={cutoff} identity={identity_key}; "
-                "prewarm it with scripts/build_factor_panel.py"
+                "prewarm new strategies with `zyq factors prepare`; "
+                "legacy strategies may keep their existing prewarm script"
             )
         result = self._compute(
             factor, snapshot, start, end, None, cutoff, [], {},
@@ -375,7 +377,8 @@ class FactorEngine:
         # 一级命中：区间完全相同。
         cached = self._read_cache(path, metadata_path, start, end)
         if cached is not None:
-            self._upgrade_metadata(metadata_path, provenance)
+            if self.cache_policy == "compute":
+                self._upgrade_metadata(metadata_path, provenance)
             return FactorResult(
                 factor.name, cached[0], cache_key, True, cached[1]
             )
@@ -384,16 +387,18 @@ class FactorEngine:
         broader = self._find_broader(directory, identity_key, start, end)
         if broader is not None:
             frame, diagnostics, broader_key = broader
-            self._upgrade_metadata(
-                directory / f"{broader_key}.json", provenance
-            )
+            if self.cache_policy == "compute":
+                self._upgrade_metadata(
+                    directory / f"{broader_key}.json", provenance
+                )
             return FactorResult(factor.name, frame, broader_key, True, diagnostics)
         if self.cache_policy == "require":
             raise FactorCacheMiss(
                 "required factor cache is missing: "
                 f"factor={factor.name} start={start} end={end} "
                 f"cutoff={cutoff} identity={identity_key}; "
-                "prewarm it with scripts/build_factor_panel.py"
+                "prewarm new strategies with `zyq factors prepare`; "
+                "legacy strategies may keep their existing prewarm script"
             )
         directory.mkdir(parents=True, exist_ok=True)
         # --- 真算 -------------------------------------------------------------

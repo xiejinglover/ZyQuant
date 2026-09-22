@@ -16,9 +16,10 @@ bounds which rows a factor may read at all; each emitted row is still computed
 from its own trailing window alone. `tests/test_cn_equity_factors.py` pins that
 property by recomputing a narrower window and comparing the shared rows.
 
-A wide panel and a manifest are also written, because the engine's own cache
-metadata records neither the factor name nor the universe, and there is no CLI
-to inspect it.
+This is the compatibility builder for existing strategies. New strategies
+declare ``factor_requirements()`` and use ``zyq factors prepare/verify``. Cache
+metadata schema 1.1 is self-describing; this script's optional wide panel is
+retained for offline analysis rather than as a second authoritative cache.
 """
 from __future__ import annotations
 

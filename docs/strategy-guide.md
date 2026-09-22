@@ -19,6 +19,18 @@
 本地策略通过模块工厂引用，例如
 `strategies.my_strategy:create_strategy`，并由 `--project-root` 确定源码根目录。
 
+### 新策略的因子声明
+
+新的因子消费策略必须纯声明所需因子，供统一预热和验证命令使用：
+
+```python
+def factor_requirements(self) -> Mapping[str, BaseFactor]:
+    return {"beta": SelfBetaFactor(), "momentum": MomentumFactor()}
+```
+
+该方法不得读数据、计算因子或修改策略状态。`prepare_run()` 仍负责从
+缓存加载稀疏视图。旧策略不强制迁移；它们的回测和专用预热脚本保持可用。
+
 ## 状态
 
 策略需要记忆时使用显式、可序列化状态。状态适合保存持仓进入日期、排名缓冲、冷却期和有限状态机，不适合保存行情矩阵、模型对象或外部连接。

@@ -12,7 +12,7 @@ from .data import (
     CanonicalBatch, DataSnapshot, DataSourceAdapter, ParquetDataProvider,
     SnapshotPublisher,
 )
-from .factors.base import FactorService
+from .factors.base import FactorRequirementProvider, FactorService
 from .strategy import (
     PreparableStrategy, Strategy, StrategyContext, StrategyDecision,
     TargetPortfolio,
@@ -29,6 +29,7 @@ __all__ = [
     "DataSnapshot",
     "DataSourceAdapter",
     "ExecutionModel",
+    "FactorRequirementProvider",
     "FactorService",
     "FutureDataError",
     "ParquetDataProvider",

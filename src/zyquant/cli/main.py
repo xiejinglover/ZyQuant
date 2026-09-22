@@ -11,7 +11,7 @@ from typing import Any
 import pandas as pd
 import yaml
 
-from zyquant.config import load_config
+from zyquant.config import load_config, resolve_project_path
 from zyquant.core import plugins, source_tree_fingerprint
 from zyquant.data import (
     ParquetDataProvider,
@@ -19,6 +19,7 @@ from zyquant.data import (
 )
 from zyquant.experiment import ExperimentStore
 from zyquant.factors import FactorEngine
+from zyquant.factors.workflow import run_factor_cache_workflow
 from zyquant.ml import (
     DatasetBuilder, ModelRegistry, PurgedTimeSeriesSplitter, SklearnTrainer,
     make_prediction_frame,
@@ -73,6 +74,13 @@ def parser() -> argparse.ArgumentParser:
     backtest_run = backtest_commands.add_parser("run")
     backtest_run.add_argument("--config", required=True, type=Path)
     backtest_run.add_argument("--project-root", type=Path, default=Path.cwd())
+
+    factors = commands.add_parser("factors", help="prepare or verify factor caches")
+    factor_commands = factors.add_subparsers(dest="factor_command", required=True)
+    for action in ("prepare", "verify"):
+        current = factor_commands.add_parser(action)
+        current.add_argument("--config", required=True, type=Path)
+        current.add_argument("--project-root", type=Path, default=Path.cwd())
 
     model = commands.add_parser("model")
     model_commands = model.add_subparsers(dest="model_command", required=True)
@@ -212,7 +220,7 @@ def _train_model(config_path: Path, project_root: Path = Path.cwd()):
         config.data.dataset_id, config.data.verify_hashes
     )
     engine = FactorEngine(
-        config.factor.cache_root,
+        resolve_project_path(config.factor.cache_root, project_root),
         config.factor.lock_timeout_seconds,
         config.factor.cache_policy,
     )
@@ -266,7 +274,7 @@ def main(argv=None) -> int:
     try:
         if args.command == "data":
             plugins.discover(kinds=("data",))
-        elif args.command in {"backtest", "model", "search"}:
+        elif args.command in {"backtest", "factors", "model", "search"}:
             plugins.discover(kinds=(
                 "factors", "models", "optimizers", "objectives",
                 "reports", "execution_models", "cost_models",
@@ -319,6 +327,21 @@ def main(argv=None) -> int:
                     config.output_root, store, args.project_root
                 ).run(config)
             _print({"run_id": result.run_id, "path": result.run_path, "metrics": result.metrics})
+        elif args.command == "factors":
+            config = load_config(args.config)
+            project_root = args.project_root.expanduser().resolve()
+            runner = WorkflowRunner(
+                resolve_project_path(config.output_root, project_root),
+                project_root=project_root,
+                create_output_root=False,
+            )
+            bindings = runner.strategy_bindings(config)
+            _print(run_factor_cache_workflow(
+                config,
+                [binding.strategy for binding in bindings],
+                project_root,
+                mode=args.factor_command,
+            ))
         elif args.command == "model" and args.model_command == "train":
             _print(_train_model(args.config, args.project_root))
         elif args.command == "model" and args.model_command == "predict":

@@ -5,10 +5,11 @@ data:
   dataset_id: cn-demo-v1
   start_date: 2025-01-01
   end_date: 2025-12-31
+  cutoff: 2025-12-31
   verify_hashes: true
 factor:
   cache_root: ./.zyquant/cache/factors
-  cache_policy: compute
+  cache_policy: require
 strategy:
   strategies:
     - plugin: pipeline

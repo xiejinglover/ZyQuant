@@ -131,42 +131,31 @@ parquet。失败路径删临时文件——绝不留半成品，否则下次会�
                                                                       /<cache_key>.json
 ```
 
-当前约 880 MB。**这个目录是累积的**：不同参数、不同代码版本的结果都堆在同一个
-因子目录下。所以核对某批因子值要认 `cache_key`，或者直接用下面的导出宽表——
-**绝不能按文件大小或修改时间猜**（这个坑踩过一次，取到了修复前的旧文件，
-结论完全反了）。
+该路径相对 `--project-root` 解析；服务器的实际绝对路径不是公共
+接口。参数化变体与不同 cutoff 可以共存，但同一定义、cutoff 和
+universe 下被新源码淘汰的旧版会在新缓存成功发布后清理。核对产物必须
+使用 `cache_key` 和 metadata，不得根据文件大小或修改时间猜测。
 
-### 产物二：导出宽表 + manifest（给人看的）
+### 产物二：批次 manifest（给人看的）
 
-缓存元数据不记因子名/版本/instruments，也没有 CLI 可查，所以额外导出：
+缓存 metadata schema 1.1 记录因子版本、definition/source key、
+instruments、数据集和哈希。统一 CLI 另外发布批次 manifest：
 
 ```
-runs/factors/panel.parquet          # trade_date × instrument_id × 6 列
-runs/factors/panel_manifest.json    # 因子名、版本、definition、cache_key、区间、覆盖率
-runs/factors/build.log
+runs/factors/<manifest-id>/manifest.json
 ```
 
-构建命令（在项目根目录执行）：
+新策略的构建与只读验证命令：
 
 ```bash
-python scripts/build_factor_panel.py --root data --dataset <dataset-id> --cache-root .zyquant/cache/factors --workers 8 --output runs/factors/panel.parquet
+zyq factors prepare --project-root . --config config.yaml
+zyq factors verify --project-root . --config config.yaml
 ```
 
-脚本里**三个参数是故意固定的，不能按调用方变**，否则缓存作废：
-`instruments=None`、`cutoff=<数据集末日>`、`start/end=数据集完整区间`。
-
-### 当前六个因子的规模（v3，2010-01-04 ~ 2026-07-24）
-
-| 因子 | 非空行数 | 覆盖率 | 首个有值日 | 说明 |
-|---|---|---|---|---|
-| `dividend_yield_l12m` | 14,517,984 | 99.97% | 2010-01-04 | lookback 0 |
-| `beta_252_hl63` | 13,969,706 | 96.20% | 2011-01-18 | 253 交易日预热 |
-| `momentum_6_1` | 13,721,392 | 94.49% | 2010-07-30 | 140 交易日预热 |
-| `net_profit_ytd` | 14,312,603 | 98.56% | 2010-01-04 | lookback 0 |
-| `operating_cash_flow_ytd` | 14,312,617 | 98.56% | 2010-01-04 | lookback 0 |
-| `roe_ytd` | 14,312,218 | 98.56% | 2010-01-04 | lookback 0 |
-
-宽表 14,522,000 行。一次性构建成本约 15 分钟（32 进程）。
+标准批次固定 `instruments=None`、`cutoff=2026-07-24` 与数据集起点到
+cutoff 的连续区间。因子数量、行数、覆盖率和构建时间是快照产物，应从
+manifest 查询，不再写成会过期的文档常量。旧策略可继续使用自身预热
+脚本，直到它们主动迁移到 `factor_requirements()`。
 
 ---
 
@@ -177,12 +166,12 @@ python scripts/build_factor_panel.py --root data --dataset <dataset-id> --cache-
 ```python
 frame = engine.compute(
     SelfBetaFactor(), snapshot, start, end,
-    instruments=None, cutoff=calendar[-1],   # 必须与构建时一致
+    instruments=None, cutoff=date(2026, 7, 24),
 ).frame
 ```
 
-开发环境默认 `cache_policy="compute"`：缓存不存在时会计算并发布。正式实验
-使用 `cache_policy="require"`，缺失时直接报错，不允许边回测边补算。
+配置默认 `cache_policy="require"`，缺失时直接报错，不允许边回测边补算。
+开发任务只有在明确要发布缓存时才显式选择 `compute`。
 
 策略消费已有缓存时使用稀疏视图：
 
@@ -191,7 +180,7 @@ view = engine.load_view(
     SelfBetaFactor(), snapshot, start, end,
     dates=decision_dates,
     instruments=None,
-    cutoff=calendar[-1],
+    cutoff=date(2026, 7, 24),
 )
 ```
 
