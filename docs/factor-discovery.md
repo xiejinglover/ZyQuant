@@ -47,6 +47,11 @@ label contract, LLM settings, candidate budget, evidence thresholds, and free
 disk guard. Use `provider: replay` with a JSON replay file for CI and offline
 validation.
 
+When a wheel is validated outside its source checkout, set the non-secret
+`ZYQUANT_BUILD_COMMIT` environment variable to the exact commit used to build
+the wheel. The frozen plan records it instead of an unrelated surrounding
+checkout revision.
+
 Candidate values are stored as campaign-local Parquet shards. Only manually
 promoted `ExpressionFactor` objects enter the canonical ZyQuant factor cache.
 The report distinguishes `evidence_only`, `model_candidate`, and

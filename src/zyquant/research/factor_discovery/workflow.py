@@ -69,12 +69,14 @@ def create_discovery_plan(
     prompt_hash = hashlib.sha256(
         f"{PROMPT_VERSION}\n{SYSTEM_PROMPT}".encode()
     ).hexdigest()
-    try:
-        git_commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        git_commit = "unknown"
+    git_commit = os.environ.get("ZYQUANT_BUILD_COMMIT", "").strip()
+    if not git_commit:
+        try:
+            git_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            git_commit = "unknown"
     plan = DiscoveryPlan.create(
         config,
         prompt_hash=prompt_hash,
