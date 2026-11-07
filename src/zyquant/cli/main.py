@@ -81,6 +81,21 @@ def parser() -> argparse.ArgumentParser:
         current = factor_commands.add_parser(action)
         current.add_argument("--config", required=True, type=Path)
         current.add_argument("--project-root", type=Path, default=Path.cwd())
+    discover = factor_commands.add_parser(
+        "discover", help="plan, run, resume, or report an LLM factor campaign"
+    )
+    discover_commands = discover.add_subparsers(dest="discover_command", required=True)
+    discover_plan = discover_commands.add_parser("plan")
+    discover_plan.add_argument("--config", required=True, type=Path)
+    discover_plan.add_argument("--output-dir", required=True, type=Path)
+    discover_run = discover_commands.add_parser("run")
+    discover_run.add_argument("--plan-dir", required=True, type=Path)
+    discover_run.add_argument("--output-dir", required=True, type=Path)
+    discover_resume = discover_commands.add_parser("resume")
+    discover_resume.add_argument("--plan-dir", required=True, type=Path)
+    discover_resume.add_argument("--run-dir", required=True, type=Path)
+    discover_report = discover_commands.add_parser("report")
+    discover_report.add_argument("--run-dir", required=True, type=Path)
 
     model = commands.add_parser("model")
     model_commands = model.add_subparsers(dest="model_command", required=True)
@@ -327,6 +342,24 @@ def main(argv=None) -> int:
                     config.output_root, store, args.project_root
                 ).run(config)
             _print({"run_id": result.run_id, "path": result.run_path, "metrics": result.metrics})
+        elif args.command == "factors" and args.factor_command == "discover":
+            from zyquant.research.factor_discovery.workflow import (
+                create_discovery_plan, run_discovery, write_discovery_report,
+            )
+
+            if args.discover_command == "plan":
+                plan = create_discovery_plan(args.config, args.output_dir)
+                _print({"status": "planned", "plan_id": plan.plan_id,
+                        "path": str(args.output_dir.expanduser().resolve())})
+            elif args.discover_command == "run":
+                _print(run_discovery(args.plan_dir, args.output_dir).model_dump(mode="json"))
+            elif args.discover_command == "resume":
+                _print(run_discovery(
+                    args.plan_dir, args.run_dir, resume=True
+                ).model_dump(mode="json"))
+            else:
+                report = write_discovery_report(args.run_dir)
+                _print({"status": "reported", "path": str(report)})
         elif args.command == "factors":
             config = load_config(args.config)
             project_root = args.project_root.expanduser().resolve()
