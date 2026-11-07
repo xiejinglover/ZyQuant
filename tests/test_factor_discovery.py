@@ -241,6 +241,25 @@ def test_replay_campaign_freezes_plan_and_never_feeds_holdout(tmp_path: Path):
         for path in run_dir.rglob("*") if path.is_file() and path.suffix != ".parquet"
     )
 
+    parallel_config = dict(config)
+    parallel_config["campaign_id"] = "test-campaign-parallel"
+    parallel_config["evaluation_workers"] = 2
+    parallel_path = tmp_path / "parallel-config.yaml"
+    parallel_path.write_text(yaml.safe_dump(parallel_config), encoding="utf-8")
+    parallel_plan = tmp_path / "parallel-plan"
+    parallel_run = tmp_path / "parallel-run"
+    create_discovery_plan(parallel_path, parallel_plan)
+    parallel_result = run_discovery(parallel_plan, parallel_run)
+    assert parallel_result.accepted_candidates == result.accepted_candidates
+    for period in ("development", "diagnostic", "holdout"):
+        serial_summary = pd.read_csv(run_dir / period / "factor_summary.csv").sort_values(
+            "factor_id"
+        ).reset_index(drop=True)
+        parallel_summary = pd.read_csv(
+            parallel_run / period / "factor_summary.csv"
+        ).sort_values("factor_id").reset_index(drop=True)
+        pd.testing.assert_frame_equal(serial_summary, parallel_summary)
+
 
 def test_replay_client_is_bounded():
     batch = CandidateBatch.model_validate({"candidates": [{

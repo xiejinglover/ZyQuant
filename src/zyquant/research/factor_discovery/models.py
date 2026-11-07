@@ -280,6 +280,7 @@ class FactorDiscoveryConfig(BaseModel):
     proposals_per_call: int = Field(default=20, ge=1, le=20)
     max_rounds: int = Field(default=20, ge=1, le=100)
     max_proposals: int = Field(default=400, ge=1, le=10000)
+    evaluation_workers: int = Field(default=1, ge=1, le=20)
     minimum_free_gb: float = Field(default=100.0, ge=0)
     random_seed: int = 20261107
     label_contract: dict[str, Any]
@@ -366,4 +367,3 @@ class DiscoveryRunResult(BaseModel):
     rounds: int
     run_dir: Path
     period_outputs: dict[str, str] = Field(default_factory=dict)
-

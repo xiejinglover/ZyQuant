@@ -44,8 +44,12 @@ zyq factors discover report --run-dir runs/campaign
 The config is separate from a normal backtest config. Important fields are the
 dataset fingerprint, pool adapter, field whitelist, three disjoint time windows,
 label contract, LLM settings, candidate budget, evidence thresholds, and free
-disk guard. Use `provider: replay` with a JSON replay file for CI and offline
-validation.
+disk guard. `evaluation_workers` controls factor-level process parallelism
+(1–20). Linux workers inherit the already-loaded PIT dataset with copy-on-write;
+set BLAS thread counts to one when using multiple workers to avoid nested
+oversubscription. Parallelism changes throughput only: proposal order, fixed
+statistical families, random samples, and output ordering remain deterministic.
+Use `provider: replay` with a JSON replay file for CI and offline validation.
 
 When a wheel is validated outside its source checkout, set the non-secret
 `ZYQUANT_BUILD_COMMIT` environment variable to the exact commit used to build

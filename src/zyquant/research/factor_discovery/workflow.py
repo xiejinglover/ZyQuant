@@ -6,7 +6,9 @@ import os
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,68 @@ class _CampaignState:
     raw_proposals: int = 0
     accepted: int = 0
     phase: str = "generation"
+
+
+@dataclass
+class _EvaluationOutcome:
+    ok: bool
+    evidence: EvidenceResult | None = None
+    sample: pd.DataFrame | None = None
+    shard_hash: str | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+
+
+_PARALLEL_RUNNER: FactorDiscoveryRunner | None = None
+_PARALLEL_DATASET: DiscoveryDataset | None = None
+
+
+def _evaluate_candidate_worker(task: dict[str, Any]) -> _EvaluationOutcome:
+    """Evaluate one factor in a forked worker using inherited read-only data."""
+    runner = _PARALLEL_RUNNER
+    dataset = _PARALLEL_DATASET
+    if runner is None or dataset is None:  # pragma: no cover - defensive
+        return _EvaluationOutcome(
+            ok=False,
+            error_type="RuntimeError",
+            error_message="parallel factor worker was not initialized",
+        )
+    candidate = CandidateSpec.model_validate(task["candidate"])
+    output_path = Path(task["output_path"])
+    temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
+    try:
+        cached_path = task.get("cached_path")
+        values = (
+            pd.read_parquet(cached_path)
+            if cached_path
+            else runner._candidate_values(candidate, dataset)
+        )
+        finite = values["factor_value"].dropna()
+        if finite.empty or not np.isfinite(finite).all():
+            raise ValueError("candidate_has_no_finite_values")
+        evidence = runner.evidence.evaluate(
+            dataset.observations,
+            values,
+            runner._factor_metadata([candidate]),
+            dataset.label_metadata,
+            dataset.exposures if task["include_exposures"] else None,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        values.to_parquet(temporary, index=False, compression="zstd")
+        os.replace(temporary, output_path)
+        return _EvaluationOutcome(
+            ok=True,
+            evidence=evidence,
+            sample=runner._sample_factor_values(values),
+            shard_hash=_file_hash(output_path),
+        )
+    except Exception as exc:
+        temporary.unlink(missing_ok=True)
+        return _EvaluationOutcome(
+            ok=False,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
 
 
 def _hash_json(payload: Any) -> str:
@@ -109,6 +173,7 @@ def create_discovery_plan(
             "pool_id": config.pool_id,
             "target_candidates": config.target_candidates,
             "max_proposals": config.max_proposals,
+            "evaluation_workers": config.evaluation_workers,
             "preferred_group_count": config.evidence.preferred_group_count,
             "fallback_group_count": config.evidence.fallback_group_count,
             "minimum_pool_size": config.evidence.minimum_pool_size,
@@ -216,8 +281,13 @@ class FactorDiscoveryRunner:
             self._append_jsonl(self.run_dir / "llm_calls.jsonl", audit)
             round_evidence: list[EvidenceResult] = []
             round_samples: list[pd.DataFrame] = []
+            scheduled: list[tuple[CandidateSpec, dict[str, Any]]] = []
+            reserved_ids: set[str] = set()
             for candidate in call.batch.candidates:
-                if state.raw_proposals >= self.config.max_proposals:
+                if (
+                    state.raw_proposals >= self.config.max_proposals
+                    or len(accepted) + len(scheduled) >= self.config.target_candidates
+                ):
                     break
                 state.raw_proposals += 1
                 record: dict[str, Any] = {
@@ -228,19 +298,29 @@ class FactorDiscoveryRunner:
                 expression_id = candidate.expression.expression_id
                 try:
                     candidate.expression.validate_contract(set(self.config.allowed_fields))
-                    if expression_id in accepted:
+                    if expression_id in accepted or expression_id in reserved_ids:
                         raise ValueError("exact_canonical_duplicate")
-                    values = self._candidate_values(candidate, development)
-                    finite = values["factor_value"].dropna()
-                    if finite.empty or not np.isfinite(finite).all():
-                        raise ValueError("candidate_has_no_finite_values")
-                    candidate_evidence = self.evidence.evaluate(
-                        development.observations,
-                        values,
-                        self._factor_metadata([candidate]),
-                        development.label_metadata,
-                        development.exposures,
-                    )
+                    reserved_ids.add(expression_id)
+                    scheduled.append((candidate, record))
+                except Exception as exc:
+                    record.update({"status": "rejected", "reason": str(exc),
+                                   "error_type": type(exc).__name__})
+                    self._append_jsonl(self.run_dir / "proposals.jsonl", record)
+                    self._save_state(state)
+            factor_dir = self.run_dir / "factor_shards"
+            tasks = [{
+                "candidate": candidate.model_dump(mode="json"),
+                "output_path": str(factor_dir / f"{candidate.expression.expression_id}.parquet"),
+                "cached_path": None,
+                # Exposure diagnostics do not enter development feedback. They
+                # are computed in full for every locked evaluation period.
+                "include_exposures": False,
+            } for candidate, _ in scheduled]
+            for (candidate, record), outcome in zip(
+                scheduled, self._evaluate_tasks(tasks, development), strict=True
+            ):
+                expression_id = candidate.expression.expression_id
+                if outcome.ok:
                     accepted[expression_id] = candidate
                     state.accepted = len(accepted)
                     record.update({"status": "accepted", "factor_id": expression_id})
@@ -248,18 +328,17 @@ class FactorDiscoveryRunner:
                         "factor_id": expression_id,
                         "candidate": candidate.model_dump(mode="json"),
                     })
-                    factor_dir = self.run_dir / "factor_shards"
-                    factor_dir.mkdir(exist_ok=True)
-                    values.to_parquet(factor_dir / f"{expression_id}.parquet", index=False)
-                    round_evidence.append(candidate_evidence)
-                    round_samples.append(self._sample_factor_values(values))
-                except Exception as exc:
-                    record.update({"status": "rejected", "reason": str(exc),
-                                   "error_type": type(exc).__name__})
+                    assert outcome.evidence is not None and outcome.sample is not None
+                    round_evidence.append(outcome.evidence)
+                    round_samples.append(outcome.sample)
+                else:
+                    record.update({
+                        "status": "rejected",
+                        "reason": outcome.error_message,
+                        "error_type": outcome.error_type,
+                    })
                 self._append_jsonl(self.run_dir / "proposals.jsonl", record)
                 self._save_state(state)
-                if len(accepted) >= self.config.target_candidates:
-                    break
             if round_evidence:
                 evidence = self.evidence.combine(
                     round_evidence,
@@ -316,24 +395,29 @@ class FactorDiscoveryRunner:
         evidence_results = []
         samples = []
         hashes = {}
+        candidates = list(accepted.items())
+        tasks = []
         for factor_id, candidate in accepted.items():
             cached = self.run_dir / "factor_shards" / f"{factor_id}.parquet"
-            values = (
-                pd.read_parquet(cached)
-                if period == "development" and cached.exists()
-                else self._candidate_values(candidate, dataset)
-            )
             shard = factor_dir / f"{factor_id}.parquet"
-            values.to_parquet(shard, index=False, compression="zstd")
-            hashes[factor_id] = _file_hash(shard)
-            evidence_results.append(self.evidence.evaluate(
-                dataset.observations,
-                values,
-                self._factor_metadata([candidate]),
-                dataset.label_metadata,
-                dataset.exposures,
-            ))
-            samples.append(self._sample_factor_values(values))
+            tasks.append({
+                "candidate": candidate.model_dump(mode="json"),
+                "output_path": str(shard),
+                "cached_path": str(cached) if period == "development" and cached.exists() else None,
+                "include_exposures": True,
+            })
+        outcomes = self._evaluate_tasks(tasks, dataset)
+        for (factor_id, _), outcome in zip(candidates, outcomes, strict=True):
+            if not outcome.ok:
+                raise RuntimeError(
+                    f"locked factor evaluation failed for {factor_id}: "
+                    f"{outcome.error_type}: {outcome.error_message}"
+                )
+            assert outcome.evidence is not None and outcome.sample is not None
+            assert outcome.shard_hash is not None
+            hashes[factor_id] = outcome.shard_hash
+            evidence_results.append(outcome.evidence)
+            samples.append(outcome.sample)
         result = self.evidence.combine(
             evidence_results,
             pd.concat(samples, ignore_index=True) if samples else None,
@@ -360,6 +444,30 @@ class FactorDiscoveryRunner:
             "factor_value_shards": hashes,
         }, indent=2), encoding="utf-8")
         os.replace(staging, destination)
+
+    def _evaluate_tasks(
+        self, tasks: list[dict[str, Any]], dataset: DiscoveryDataset
+    ) -> list[_EvaluationOutcome]:
+        if not tasks:
+            return []
+        global _PARALLEL_RUNNER, _PARALLEL_DATASET
+        _PARALLEL_RUNNER = self
+        _PARALLEL_DATASET = dataset
+        workers = min(self.config.evaluation_workers, len(tasks))
+        try:
+            if workers <= 1:
+                return [_evaluate_candidate_worker(task) for task in tasks]
+            try:
+                context = get_context("fork")
+            except ValueError:  # pragma: no cover - platforms without fork
+                return [_evaluate_candidate_worker(task) for task in tasks]
+            with ProcessPoolExecutor(
+                max_workers=workers, mp_context=context
+            ) as executor:
+                return list(executor.map(_evaluate_candidate_worker, tasks, chunksize=1))
+        finally:
+            _PARALLEL_RUNNER = None
+            _PARALLEL_DATASET = None
 
     def _sample_factor_values(self, values: pd.DataFrame) -> pd.DataFrame:
         sample = (
