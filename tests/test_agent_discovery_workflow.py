@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 import yaml
 
 from zyquant.research.agent_discovery import (
@@ -23,6 +25,19 @@ from zyquant.research.agent_discovery.workflow import (
 from zyquant.research.factor_discovery.adapter import DiscoveryDataset
 
 from tests.test_agent_discovery_models import config as contract_config
+import zyquant.research.agent_discovery.workflow as agent_workflow
+
+
+@pytest.fixture(autouse=True)
+def _sufficient_campaign_resources(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replay tests exercise contracts, not the host running the test suite."""
+
+    monkeypatch.setattr(
+        agent_workflow.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=512 * 1024**3),
+    )
+    monkeypatch.setattr(agent_workflow, "_available_memory_gb", lambda: 256.0)
 
 
 class SyntheticAdapter:
