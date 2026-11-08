@@ -108,6 +108,11 @@ def main(argv: list[str] | None = None) -> int:
     verify_rdagent_install()
     assert_no_qlib_modules_loaded()
     request = _read_json_object(args.request)
+    # Bind the response to the exact immutable request before enriching the
+    # in-memory context with settings from the separately frozen plan.
+    request.setdefault(
+        "request_id", hashlib.sha256(_canonical_json(dict(request))).hexdigest()
+    )
     if args.plan_path is not None:
         plan = _read_json_object(args.plan_path)
         config = plan.get("config", {})
