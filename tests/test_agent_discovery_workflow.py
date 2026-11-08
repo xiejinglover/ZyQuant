@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import date
+from math import nan
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -184,6 +185,7 @@ def test_redaction_preserves_usage_counts_but_removes_credentials() -> None:
         "usage": {"input_tokens": 12, "output_tokens": 7, "total_tokens": 19},
         "access_token": "credential",
         "nested": {"openai_api_key": "sk-proj-sensitive-value"},
+        "non_finite": nan,
     })
 
     assert payload["usage"] == {
@@ -191,3 +193,4 @@ def test_redaction_preserves_usage_counts_but_removes_credentials() -> None:
     }
     assert payload["access_token"] == "[REDACTED]"
     assert payload["nested"]["openai_api_key"] == "[REDACTED]"
+    assert payload["non_finite"] is None

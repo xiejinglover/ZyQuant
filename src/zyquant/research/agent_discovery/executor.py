@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +33,9 @@ def sha256_json(payload: Any) -> str:
 def atomic_write_json(path: str | Path, payload: Any, *, immutable: bool = False) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    serialized = json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n"
+    serialized = json.dumps(
+        payload, indent=2, ensure_ascii=False, default=str, allow_nan=False
+    ) + "\n"
     if destination.exists():
         if immutable and destination.read_text(encoding="utf-8") != serialized:
             raise ValueError(f"immutable artifact differs: {destination}")
@@ -73,6 +77,10 @@ def redact_payload(value: Any) -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [redact_payload(item) for item in value]
+    if isinstance(value, Real) and not isinstance(value, bool):
+        if not math.isfinite(float(value)):
+            return None
+        return value.item() if hasattr(value, "item") else value
     if isinstance(value, str):
         value = re.sub(r"sk-(?:proj-)?[A-Za-z0-9_-]{12,}", "[REDACTED]", value)
         value = re.sub(

@@ -875,7 +875,9 @@ class AgentCampaignRunner:
 
     def _append_jsonl(self, name: str, payload: dict[str, Any]) -> None:
         with (self.run_dir / name).open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(redact_payload(payload), ensure_ascii=False, default=str) + "\n")
+            handle.write(json.dumps(
+                redact_payload(payload), ensure_ascii=False, default=str, allow_nan=False
+            ) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
 
