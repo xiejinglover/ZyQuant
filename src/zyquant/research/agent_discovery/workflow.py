@@ -569,6 +569,12 @@ class AgentCampaignRunner:
         temporary = output.with_suffix(".tmp.parquet")
         sample.to_parquet(temporary, index=False, compression="zstd")
         os.replace(temporary, output)
+        decision_dates = tuple(sorted(sample["trade_date"].drop_duplicates()))
+        cap = self.config.evidence.valid_decision_cap
+        if cap is not None and len(decision_dates) > cap:
+            positions = np.linspace(0, len(decision_dates) - 1, cap, dtype=int)
+            decision_dates = tuple(decision_dates[position] for position in positions)
+        novelty_sample = sample[sample["trade_date"].isin(decision_dates)]
         nearest_id: str | None = None
         nearest = 0.0
         for factor_id in accepted:
@@ -576,7 +582,10 @@ class AgentCampaignRunner:
             if not path.exists():
                 continue
             other = pd.read_parquet(path)
-            merged = sample.merge(other, on=["trade_date", "instrument_id"], how="inner")
+            other = other[other["trade_date"].isin(decision_dates)]
+            merged = novelty_sample.merge(
+                other, on=["trade_date", "instrument_id"], how="inner"
+            )
             if len(merged) < 3:
                 continue
             absolute = _median_cross_sectional_spearman(
@@ -584,12 +593,28 @@ class AgentCampaignRunner:
             )
             if absolute > nearest:
                 nearest, nearest_id = absolute, factor_id
-        for factor_id in self.config.baseline_factor_ids:
-            field_name = f"factor.{factor_id}"
-            if field_name not in dataset.fields:
-                continue
-            other = dataset.fields[field_name].rename(columns={"value": factor_id})
-            merged = sample.merge(other, on=["trade_date", "instrument_id"], how="inner")
+        baseline_pairs = tuple(
+            (factor_id, f"factor.{factor_id}")
+            for factor_id in self.config.baseline_factor_ids
+            if f"factor.{factor_id}" in dataset.fields
+        )
+        baseline_fields = tuple(field_name for _, field_name in baseline_pairs)
+        load_many = getattr(dataset.fields, "load_many", None)
+        baseline_matrix = (
+            load_many(baseline_fields, decision_dates)
+            if callable(load_many) and baseline_fields else None
+        )
+        for factor_id, field_name in baseline_pairs:
+            if baseline_matrix is not None:
+                other = baseline_matrix[["trade_date", "instrument_id", field_name]].rename(
+                    columns={field_name: factor_id}
+                )
+            else:
+                other = dataset.fields[field_name].rename(columns={"value": factor_id})
+                other = other[other["trade_date"].isin(decision_dates)]
+            merged = novelty_sample.merge(
+                other, on=["trade_date", "instrument_id"], how="inner"
+            )
             absolute = _median_cross_sectional_spearman(
                 merged, candidate.factor_id, factor_id
             )
