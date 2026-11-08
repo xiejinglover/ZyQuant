@@ -35,7 +35,8 @@ def atomic_write_json(path: str | Path, payload: Any, *, immutable: bool = False
     if destination.exists():
         if immutable and destination.read_text(encoding="utf-8") != serialized:
             raise ValueError(f"immutable artifact differs: {destination}")
-        return
+        if immutable:
+            return
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{destination.name}.", dir=destination.parent, text=True
     )

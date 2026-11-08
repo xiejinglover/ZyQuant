@@ -16,6 +16,7 @@ from zyquant.research.agent_discovery import (
     ResourceGuards,
     StageBudgets,
 )
+from zyquant.research.agent_discovery.executor import atomic_write_json
 from zyquant.research.agent_discovery.report import verify_agent_campaign
 from zyquant.research.agent_discovery.workflow import (
     create_agent_plan,
@@ -161,3 +162,19 @@ def test_agent_context_never_contains_diagnostic_or_reference_evidence(tmp_path:
         path.read_text(encoding="utf-8", errors="ignore")
         for path in run_dir.rglob("*") if path.is_file() and path.suffix != ".parquet"
     )
+def test_atomic_write_json_updates_mutable_artifact(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    atomic_write_json(path, {"round": 1})
+    atomic_write_json(path, {"round": 2})
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"round": 2}
+
+
+def test_atomic_write_json_preserves_equal_immutable_artifact(tmp_path: Path) -> None:
+    path = tmp_path / "request.json"
+    atomic_write_json(path, {"request": 1}, immutable=True)
+    atomic_write_json(path, {"request": 1}, immutable=True)
+
+    with pytest.raises(ValueError, match="immutable artifact differs"):
+        atomic_write_json(path, {"request": 2}, immutable=True)
+
