@@ -53,11 +53,20 @@ def atomic_write_json(path: str | Path, payload: Any, *, immutable: bool = False
 
 def redact_payload(value: Any) -> Any:
     """Recursively remove values that must never enter a campaign artifact."""
-    sensitive = ("api_key", "apikey", "authorization", "bearer", "password", "secret", "token")
+    sensitive = {
+        "api_key", "apikey", "openai_api_key", "authorization", "bearer",
+        "password", "secret", "client_secret", "access_token", "refresh_token",
+        "id_token", "bearer_token",
+    }
     if isinstance(value, Mapping):
         return {
             str(key): (
-                "[REDACTED]" if any(term in str(key).lower() for term in sensitive)
+                "[REDACTED]"
+                if str(key).lower() in sensitive
+                or (
+                    str(key).lower().endswith("_token")
+                    and not str(key).lower().endswith("_tokens")
+                )
                 else redact_payload(item)
             )
             for key, item in value.items()

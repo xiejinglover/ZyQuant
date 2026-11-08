@@ -16,7 +16,7 @@ from zyquant.research.agent_discovery import (
     ResourceGuards,
     StageBudgets,
 )
-from zyquant.research.agent_discovery.executor import atomic_write_json
+from zyquant.research.agent_discovery.executor import atomic_write_json, redact_payload
 from zyquant.research.agent_discovery.report import verify_agent_campaign
 from zyquant.research.agent_discovery.workflow import (
     create_agent_plan,
@@ -178,3 +178,16 @@ def test_atomic_write_json_preserves_equal_immutable_artifact(tmp_path: Path) ->
     with pytest.raises(ValueError, match="immutable artifact differs"):
         atomic_write_json(path, {"request": 2}, immutable=True)
 
+
+def test_redaction_preserves_usage_counts_but_removes_credentials() -> None:
+    payload = redact_payload({
+        "usage": {"input_tokens": 12, "output_tokens": 7, "total_tokens": 19},
+        "access_token": "credential",
+        "nested": {"openai_api_key": "sk-proj-sensitive-value"},
+    })
+
+    assert payload["usage"] == {
+        "input_tokens": 12, "output_tokens": 7, "total_tokens": 19,
+    }
+    assert payload["access_token"] == "[REDACTED]"
+    assert payload["nested"]["openai_api_key"] == "[REDACTED]"
