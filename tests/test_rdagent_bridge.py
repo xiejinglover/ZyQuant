@@ -255,6 +255,26 @@ def test_structured_handler_uses_mock_llm_and_upstream_trace_types() -> None:
         def complete(self, **kwargs: object) -> StructuredCompletion:
             self.calls.append(kwargs)
             response_model = kwargs["response_model"]
+            if len(self.calls) == 1:
+                response_model.model_validate(
+                    {
+                        "hypotheses": [],
+                        "candidates": [
+                            {
+                                "candidate_name": "invalid_rank",
+                                "hypothesis_id": "hyp_0002",
+                                "expression": {
+                                    "op": "rank",
+                                    "args": [
+                                        {"op": "field", "source": "raw", "field": "close"}
+                                    ],
+                                },
+                                "direction": 1,
+                                "rationale": "This deliberately invalid first response tests repair.",
+                            }
+                        ],
+                    }
+                )
             value = response_model.model_validate(
                 {
                     "hypotheses": [
@@ -323,6 +343,7 @@ def test_structured_handler_uses_mock_llm_and_upstream_trace_types() -> None:
                 {"factor_id": "old", "failure_reasons": ["numeric_duplicate_correlation"]}
             ],
             "agent": {"model": "gpt-5.6-sol", "reasoning_effort": "medium"},
+            "budgets": {"max_repairs": 3},
         },
         count=1,
         iteration=2,
@@ -330,8 +351,11 @@ def test_structured_handler_uses_mock_llm_and_upstream_trace_types() -> None:
     assert hypotheses[0].hypothesis_id == "hyp_0002"
     assert candidates[0].candidate_name == "volume_price_exhaustion"
     assert audit["response_id"] == "resp_mock"
-    assert backend.calls[0]["model"] == "gpt-5.6-sol"
-    assert backend.calls[0]["reasoning_effort"] == "medium"
+    assert audit["repair_attempts"] == 1
+    assert len(backend.calls) == 2
+    assert backend.calls[1]["model"] == "gpt-5.6-sol"
+    assert backend.calls[1]["reasoning_effort"] == "medium"
+    assert "failed schema validation" in str(backend.calls[1]["user_prompt"])
     assert not any(name == "qlib" or name.startswith("qlib.") for name in sys.modules)
 
 

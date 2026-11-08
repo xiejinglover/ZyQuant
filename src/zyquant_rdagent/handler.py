@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from .bridge import (
     BridgeExperiment,
@@ -39,6 +39,7 @@ class StructuredCompletion:
     value: Any
     response_id: str | None = None
     usage: dict[str, Any] | None = None
+    repair_attempts: int = 0
 
 
 class OpenAIResponsesBackend:
@@ -279,19 +280,50 @@ class StructuredRDAgentHandler:
             or context.get("reasoning_effort")
             or os.environ.get("ZYQUANT_RDAGENT_REASONING_EFFORT", "medium")
         )
-        result = self.backend.complete(
-            user_prompt=user_prompt,
-            system_prompt=_SYSTEM_PROMPT,
-            response_model=response_model,
-            model=model,
-            reasoning_effort=reasoning_effort,
-        )
+        budgets = context.get("budgets", {})
+        if not isinstance(budgets, Mapping):
+            budgets = {}
+        max_repairs = int(budgets.get("max_repairs", 3))
+        prompt = user_prompt
+        result: Any = None
+        repairs = 0
+        while True:
+            try:
+                result = self.backend.complete(
+                    user_prompt=prompt,
+                    system_prompt=_SYSTEM_PROMPT,
+                    response_model=response_model,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                )
+                break
+            except ValidationError as exc:
+                if repairs >= max_repairs:
+                    raise
+                repairs += 1
+                prompt = (
+                    user_prompt
+                    + "\n\nThe previous structured response failed schema validation. "
+                    + "Return a corrected full response. Validation errors: "
+                    + json.dumps(
+                        exc.errors(include_input=False),
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                )
         assert_no_qlib_modules_loaded()
         if isinstance(result, StructuredCompletion):
-            return result
+            return StructuredCompletion(
+                result.value,
+                response_id=result.response_id,
+                usage=result.usage,
+                repair_attempts=repairs,
+            )
         if isinstance(result, response_model):
-            return StructuredCompletion(result)
-        return StructuredCompletion(response_model.model_validate(result))
+            return StructuredCompletion(result, repair_attempts=repairs)
+        return StructuredCompletion(
+            response_model.model_validate(result), repair_attempts=repairs
+        )
 
     @staticmethod
     def _context(context: Mapping[str, Any]) -> dict[str, Any]:
@@ -444,6 +476,9 @@ class StructuredRDAgentHandler:
                 "Avoid exact or economically equivalent prior expressions.",
                 "Explain an economic mechanism before formalizing its expression.",
                 "Use only allowed_fields and declarative operators in the schema.",
+                "A field node requires source and field, with no args or window.",
+                "rank is a rolling time-series rank, never a cross-sectional rank, and requires window 1..252.",
+                "lag, delta, return, mean, std, sum, rolling_min, rolling_max, rank, ema, and corr require window 1..252.",
             ],
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -489,6 +524,7 @@ class StructuredRDAgentHandler:
             "usage": completion.usage or {},
             "action": action,
             "ordinal": ordinal,
+            "repair_attempts": completion.repair_attempts,
         }
 
 

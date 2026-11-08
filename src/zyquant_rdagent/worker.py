@@ -112,10 +112,15 @@ def main(argv: list[str] | None = None) -> int:
         plan = _read_json_object(args.plan_path)
         config = plan.get("config", {})
         agent = config.get("agent", {}) if isinstance(config, Mapping) else {}
+        budgets = config.get("budgets", {}) if isinstance(config, Mapping) else {}
         context = request.get("context", {})
         if isinstance(context, Mapping) and isinstance(agent, Mapping) and "agent" not in context:
             request = dict(request)
-            request["context"] = {**dict(context), "agent": dict(agent)}
+            request["context"] = {
+                **dict(context),
+                "agent": dict(agent),
+                "budgets": dict(budgets) if isinstance(budgets, Mapping) else {},
+            }
     response = execute(request, _load_handler())
     assert_no_qlib_modules_loaded()
     _write_immutable(args.response, response)
