@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -376,6 +377,12 @@ class AgentCampaignRunner:
                 for row in self._read_jsonl("factor_proposals.jsonl")
                 if "candidate" in row
             } | set(accepted)
+            pending: list[
+                tuple[FactorCandidateSpec, dict[str, Any], Future[dict[str, Any]]]
+            ] = []
+            pool = ThreadPoolExecutor(
+                max_workers=min(self.config.resources.factor_workers, count)
+            )
             for candidate in candidates[:count]:
                 if candidate.factor_id in recorded_ids:
                     continue
@@ -389,13 +396,33 @@ class AgentCampaignRunner:
                     candidate.expression.validate_contract(set(self.config.allowed_fields))
                     if candidate.factor_id in accepted or candidate.factor_id in reserved:
                         raise ValueError("exact_canonical_duplicate")
-                    validation = self._validate_numeric(candidate, accepted)
+                    reserved.add(candidate.factor_id)
+                    pending.append((
+                        candidate,
+                        record,
+                        pool.submit(self._validate_numeric, candidate, dict(accepted)),
+                    ))
+                except Exception as exc:
+                    record.update({
+                        "status": "rejected", "reason": str(exc),
+                        "error_type": type(exc).__name__,
+                    })
+                    self._append_jsonl("factor_proposals.jsonl", record)
+                    self._save_state(state)
+            pool.shutdown(wait=True)
+            for candidate, record, future in pending:
+                try:
+                    validation = future.result()
+                    novelty = self._accepted_shard_novelty(candidate, accepted)
+                    if novelty["maximum_absolute_correlation"] > validation.get(
+                        "maximum_absolute_correlation", 0.0
+                    ):
+                        validation.update(novelty)
                     if validation.get("maximum_absolute_correlation", 0.0) >= (
                         self.config.exact_duplicate_correlation
                     ):
                         raise ValueError("numeric_duplicate_correlation")
                     record.update({"status": "accepted", "validation": validation})
-                    reserved.add(candidate.factor_id)
                     accepted[candidate.factor_id] = candidate
                     self._append_jsonl("accepted_factors.jsonl", {
                         "factor_id": candidate.factor_id,
@@ -666,6 +693,34 @@ class AgentCampaignRunner:
                 if item.get("status") == "rejected"
             ][-100:],
             "experiment_feedback": feedback[-60:],
+        }
+
+    def _accepted_shard_novelty(
+        self,
+        candidate: FactorCandidateSpec,
+        accepted: dict[str, FactorCandidateSpec],
+    ) -> dict[str, Any]:
+        factor_dir = self.run_dir / "factor_shards"
+        sample = pd.read_parquet(factor_dir / f"{candidate.factor_id}.parquet")
+        nearest_id: str | None = None
+        nearest = 0.0
+        for factor_id in accepted:
+            path = factor_dir / f"{factor_id}.parquet"
+            if not path.exists():
+                continue
+            other = pd.read_parquet(path)
+            merged = sample.merge(other, on=["trade_date", "instrument_id"], how="inner")
+            if len(merged) < 3:
+                continue
+            absolute = _median_cross_sectional_spearman(
+                merged, candidate.factor_id, factor_id
+            )
+            if absolute > nearest:
+                nearest, nearest_id = absolute, factor_id
+        return {
+            "maximum_absolute_correlation": nearest,
+            "nearest_factor_id": nearest_id,
+            "redundant": nearest >= self.config.redundant_correlation,
         }
 
     def _make_client(self) -> AgentClient:
