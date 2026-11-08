@@ -24,10 +24,19 @@ class ExpressionEvaluator:
         index: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         spec.validate_contract(self.allowed_fields)
-        normalized = {name: self._series(name, frame) for name, frame in fields.items()}
-        missing = spec.fields() - set(normalized)
+        required = spec.fields()
+        available = set(fields)
+        missing = required - available
         if missing:
             raise ValueError(f"missing field values: {sorted(missing)}")
+        # Normalizing every registered field made wide research panels needlessly
+        # materialize hundreds of long frames for a two-leaf expression.  Restrict
+        # work to the expression leaves so adapters may expose lazy mappings over
+        # large PIT panels without changing the public Mapping contract.
+        normalized = {
+            name: self._series(name, fields[name])
+            for name in sorted(required)
+        }
         if index is None:
             indexes = [series.index for series in normalized.values()]
             if not indexes:

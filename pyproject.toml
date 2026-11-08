@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zyquant"
-version = "2.1.0"
+version = "2.2.0"
 description = "Lightweight, reproducible daily-frequency quant research framework"
 readme = "README.md"
 license = "Apache-2.0"
@@ -39,6 +39,10 @@ sql = ["SQLAlchemy>=2.0"]
 hermes = ["PyMySQL>=1.1,<2", "psutil>=5.9"]
 jqdata = ["jqdatasdk>=1.9.8,<2"]
 ai = ["openai>=2.8,<3"]
+# RD-Agent intentionally lives in an isolated Python 3.11 worker environment.
+# Keeping it out of this extra prevents its orchestration dependencies from
+# contaminating the core ZyQuant installation.
+agent = ["openai>=2.8,<3"]
 connectors = [
   "PyMySQL>=1.1,<2",
   "jqdatasdk>=1.9.8,<2",

@@ -92,6 +92,24 @@ def test_evaluator_uses_pre_observation_history_but_returns_only_requested_rows(
     assert result.iloc[0]["value"] == pytest.approx(3.0)
 
 
+def test_evaluator_materializes_only_expression_leaves():
+    days = pd.date_range("2026-01-01", periods=2, tz="Asia/Shanghai")
+    used = pd.DataFrame({
+        "trade_date": days,
+        "instrument_id": ["A", "A"],
+        "value": [1.0, 2.0],
+    })
+    # Wide/lazy adapters may advertise hundreds of fields. An unrelated field
+    # must not be normalized merely because it exists in the mapping.
+    unused_invalid = pd.DataFrame({"not_a_factor_column": [1.0]})
+    spec = ExpressionSpec.model_validate(FIELD_CLOSE)
+    result = ExpressionEvaluator({"post_adjusted.close", "raw.unused"}).evaluate(
+        spec,
+        {"post_adjusted.close": used, "raw.unused": unused_invalid},
+    )
+    assert result["value"].tolist() == [1.0, 2.0]
+
+
 def _evidence_tables(decisions=40, instruments=40):
     rows = []
     values = []
