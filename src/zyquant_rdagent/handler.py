@@ -189,6 +189,16 @@ class StructuredRDAgentHandler:
             raise ValueError("RD-Agent hypothesis iteration differs from request")
         hypothesis_ids = {hypothesis.hypothesis_id for hypothesis in hypotheses}
         allowed_fields = set(clean_context.get("allowed_fields", ()))
+        candidates, deterministic_repairs = self._repair_field_prefixes(
+            candidates, allowed_fields
+        )
+        if deterministic_repairs:
+            completion = StructuredCompletion(
+                completion.value,
+                response_id=completion.response_id,
+                usage=completion.usage,
+                repair_attempts=completion.repair_attempts + deterministic_repairs,
+            )
         for hypothesis in hypotheses:
             if not set(hypothesis.candidate_fields).issubset(allowed_fields):
                 raise ValueError("RD-Agent hypothesis references fields outside whitelist")
@@ -205,6 +215,51 @@ class StructuredRDAgentHandler:
             loop_id=iteration,
         )
         return hypotheses, candidates, self._audit(completion, "factor", iteration)
+
+    @staticmethod
+    def _repair_field_prefixes(
+        candidates: tuple[Any, ...], allowed_fields: set[str]
+    ) -> tuple[tuple[Any, ...], int]:
+        """Repair the unambiguous ``factor.factor.foo`` structured-output typo."""
+
+        from zyquant.research.factor_discovery.models import ExpressionSpec, Operator
+
+        def repair(node: ExpressionSpec) -> tuple[ExpressionSpec, bool]:
+            changed = False
+            args = []
+            for child in node.args:
+                repaired, child_changed = repair(child)
+                args.append(repaired)
+                changed = changed or child_changed
+            updates: dict[str, Any] = {}
+            if tuple(args) != node.args:
+                updates["args"] = tuple(args)
+            if (
+                node.op == Operator.FIELD
+                and node.source is not None
+                and node.field is not None
+                and node.leaf_key not in allowed_fields
+                and node.field in allowed_fields
+                and node.field.startswith(f"{node.source}.")
+            ):
+                updates["field"] = node.field.split(".", 1)[1]
+                changed = True
+            return (node.model_copy(update=updates) if updates else node), changed
+
+        repaired_candidates = []
+        repairs = 0
+        for candidate in candidates:
+            expression, changed = repair(candidate.expression)
+            if changed:
+                repairs += 1
+                candidate = candidate.model_copy(
+                    update={
+                        "expression": expression,
+                        "repair_attempt": min(3, candidate.repair_attempt + 1),
+                    }
+                )
+            repaired_candidates.append(candidate)
+        return tuple(repaired_candidates), repairs
 
     def propose_experiment(
         self,
@@ -477,6 +532,7 @@ class StructuredRDAgentHandler:
                 "Explain an economic mechanism before formalizing its expression.",
                 "Use only allowed_fields and declarative operators in the schema.",
                 "A field node requires source and field, with no args or window.",
+                "For allowed field factor.foo use source='factor' and field='foo'; never put 'factor.' inside field.",
                 "rank is a rolling time-series rank, never a cross-sectional rank, and requires window 1..252.",
                 "lag, delta, return, mean, std, sum, rolling_min, rolling_max, rank, ema, and corr require window 1..252.",
             ],

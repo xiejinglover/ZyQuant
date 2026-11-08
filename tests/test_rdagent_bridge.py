@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel
+from zyquant.research.agent_discovery import FactorCandidateSpec
 
 from zyquant_rdagent import (
     RDAGENT_COMMIT,
@@ -357,6 +358,28 @@ def test_structured_handler_uses_mock_llm_and_upstream_trace_types() -> None:
     assert backend.calls[1]["reasoning_effort"] == "medium"
     assert "failed schema validation" in str(backend.calls[1]["user_prompt"])
     assert not any(name == "qlib" or name.startswith("qlib.") for name in sys.modules)
+
+
+def test_structured_handler_repairs_unambiguous_double_field_prefix() -> None:
+    candidate = FactorCandidateSpec.model_validate(
+        {
+            "candidate_name": "double_prefix",
+            "hypothesis_id": "hyp_0001",
+            "expression": {
+                "op": "field",
+                "source": "factor",
+                "field": "factor.ema20x_alpha_20",
+            },
+            "direction": 1,
+            "rationale": "The duplicated namespace is an unambiguous structured-output typo.",
+        }
+    )
+    repaired, count = StructuredRDAgentHandler._repair_field_prefixes(
+        (candidate,), {"factor.ema20x_alpha_20"}
+    )
+    assert count == 1
+    assert repaired[0].expression.leaf_key == "factor.ema20x_alpha_20"
+    assert repaired[0].repair_attempt == 1
 
 
 def test_default_loop_uses_only_upstream_loopbase_and_trace(
