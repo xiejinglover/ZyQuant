@@ -415,6 +415,36 @@ def test_structured_handler_repairs_hypothesis_field_prefixes() -> None:
     assert repaired[0].candidate_fields == ("factor.alpha", "factor.beta")
 
 
+def test_structured_handler_binds_hypothesis_metadata_to_candidate_ast() -> None:
+    hypothesis = ResearchHypothesis(
+        hypothesis_id="hyp_0001",
+        iteration=1,
+        title="Alias-safe metadata",
+        thesis="The executable AST is authoritative for registered fields.",
+        economic_mechanism="A friendly narrative alias must not abort a valid round.",
+        expected_direction=1,
+        candidate_fields=("friendly_cashflow_alias",),
+    )
+    candidate = FactorCandidateSpec.model_validate(
+        {
+            "candidate_name": "registered_cashflow",
+            "hypothesis_id": "hyp_0001",
+            "expression": {
+                "op": "field",
+                "source": "factor",
+                "field": "registered_cashflow",
+            },
+            "direction": 1,
+            "rationale": "Use the registered PIT factor referenced by the AST.",
+        }
+    )
+    repaired, count = StructuredRDAgentHandler._repair_hypothesis_fields_from_candidates(
+        (hypothesis,), (candidate,), {"factor.registered_cashflow"}
+    )
+    assert count == 1
+    assert repaired[0].candidate_fields == ("factor.registered_cashflow",)
+
+
 def test_default_loop_uses_only_upstream_loopbase_and_trace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

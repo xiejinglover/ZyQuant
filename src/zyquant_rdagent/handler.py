@@ -196,6 +196,10 @@ class StructuredRDAgentHandler:
             hypotheses, allowed_fields
         )
         deterministic_repairs += hypothesis_repairs
+        hypotheses, metadata_repairs = self._repair_hypothesis_fields_from_candidates(
+            hypotheses, candidates, allowed_fields
+        )
+        deterministic_repairs += metadata_repairs
         if deterministic_repairs:
             completion = StructuredCompletion(
                 completion.value,
@@ -297,6 +301,51 @@ class StructuredRDAgentHandler:
                 hypothesis = hypothesis.model_copy(
                     update={"candidate_fields": tuple(fields)}
                 )
+            repaired_hypotheses.append(hypothesis)
+        return tuple(repaired_hypotheses), repairs
+
+    @staticmethod
+    def _repair_hypothesis_fields_from_candidates(
+        hypotheses: tuple[Any, ...],
+        candidates: tuple[Any, ...],
+        allowed_fields: set[str],
+    ) -> tuple[tuple[Any, ...], int]:
+        """Bind narrative field metadata to the executable candidate ASTs.
+
+        ``candidate_fields`` is descriptive RD-Agent trace metadata, while the
+        candidate AST is the executable security boundary.  Models sometimes
+        use a friendly alias in the metadata even though the AST contains the
+        correct registered field.  Reconstructing the metadata from the AST is
+        deterministic and prevents an otherwise valid round from being lost.
+        """
+
+        def leaves(node: Any) -> list[str]:
+            values: list[str] = []
+            leaf_key = getattr(node, "leaf_key", None)
+            if leaf_key is not None:
+                values.append(str(leaf_key))
+            for child in getattr(node, "args", ()):
+                values.extend(leaves(child))
+            return values
+
+        repaired_hypotheses = []
+        repairs = 0
+        for hypothesis in hypotheses:
+            if set(hypothesis.candidate_fields).issubset(allowed_fields):
+                repaired_hypotheses.append(hypothesis)
+                continue
+            actual_fields: list[str] = []
+            for candidate in candidates:
+                if candidate.hypothesis_id != hypothesis.hypothesis_id:
+                    continue
+                for field in leaves(candidate.expression):
+                    if field in allowed_fields and field not in actual_fields:
+                        actual_fields.append(field)
+            if actual_fields:
+                hypothesis = hypothesis.model_copy(
+                    update={"candidate_fields": tuple(actual_fields)}
+                )
+                repairs += 1
             repaired_hypotheses.append(hypothesis)
         return tuple(repaired_hypotheses), repairs
 
