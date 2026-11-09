@@ -192,6 +192,10 @@ class StructuredRDAgentHandler:
         candidates, deterministic_repairs = self._repair_field_prefixes(
             candidates, allowed_fields
         )
+        hypotheses, hypothesis_repairs = self._repair_hypothesis_field_prefixes(
+            hypotheses, allowed_fields
+        )
+        deterministic_repairs += hypothesis_repairs
         if deterministic_repairs:
             completion = StructuredCompletion(
                 completion.value,
@@ -266,6 +270,35 @@ class StructuredRDAgentHandler:
                 )
             repaired_candidates.append(candidate)
         return tuple(repaired_candidates), repairs
+
+    @staticmethod
+    def _repair_hypothesis_field_prefixes(
+        hypotheses: tuple[Any, ...], allowed_fields: set[str]
+    ) -> tuple[tuple[Any, ...], int]:
+        """Canonicalize unambiguous field names in non-executable hypotheses."""
+
+        repaired_hypotheses = []
+        repairs = 0
+        for hypothesis in hypotheses:
+            fields = []
+            changed = False
+            for field in hypothesis.candidate_fields:
+                canonical = field
+                candidates = [f"factor.{field}"]
+                if field.startswith("factor.factor."):
+                    candidates.append(field.removeprefix("factor."))
+                matches = [item for item in candidates if item in allowed_fields]
+                if field not in allowed_fields and len(set(matches)) == 1:
+                    canonical = matches[0]
+                    changed = True
+                fields.append(canonical)
+            if changed:
+                repairs += 1
+                hypothesis = hypothesis.model_copy(
+                    update={"candidate_fields": tuple(fields)}
+                )
+            repaired_hypotheses.append(hypothesis)
+        return tuple(repaired_hypotheses), repairs
 
     def propose_experiment(
         self,

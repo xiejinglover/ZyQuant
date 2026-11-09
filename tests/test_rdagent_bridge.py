@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel
-from zyquant.research.agent_discovery import FactorCandidateSpec
+from zyquant.research.agent_discovery import FactorCandidateSpec, ResearchHypothesis
 
 from zyquant_rdagent import (
     RDAGENT_COMMIT,
@@ -396,6 +396,23 @@ def test_structured_handler_repairs_unambiguous_double_field_prefix() -> None:
     assert count == 1
     assert repaired[0].expression.leaf_key == "factor.ema20x_alpha_20"
     assert repaired[0].repair_attempt == 1
+
+
+def test_structured_handler_repairs_hypothesis_field_prefixes() -> None:
+    hypothesis = ResearchHypothesis(
+        hypothesis_id="hyp_0001",
+        iteration=1,
+        title="Canonical field metadata",
+        thesis="Metadata must use the same registered field namespace.",
+        economic_mechanism="Canonical names keep the research trace auditable.",
+        expected_direction=1,
+        candidate_fields=("factor.factor.alpha", "beta"),
+    )
+    repaired, count = StructuredRDAgentHandler._repair_hypothesis_field_prefixes(
+        (hypothesis,), {"factor.alpha", "factor.beta"}
+    )
+    assert count == 1
+    assert repaired[0].candidate_fields == ("factor.alpha", "factor.beta")
 
 
 def test_default_loop_uses_only_upstream_loopbase_and_trace(
