@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import shutil
 import subprocess
 import tempfile
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +38,33 @@ from .models import (
     ResearchHypothesis,
 )
 from .replay import ReplayAgentClient
+
+
+_FACTOR_PROCESS_RUNNER: "AgentCampaignRunner | None" = None
+
+
+def _initialize_factor_process(
+    plan_payload: dict[str, Any], run_dir: str,
+) -> None:
+    """Build one persistent, isolated PIT dataset per factor worker process."""
+
+    global _FACTOR_PROCESS_RUNNER
+    plan = AgentCampaignPlan.model_validate(plan_payload)
+    _FACTOR_PROCESS_RUNNER = AgentCampaignRunner(plan, run_dir)
+
+
+def _validate_numeric_in_process(
+    candidate_payload: dict[str, Any],
+    accepted_payload: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if _FACTOR_PROCESS_RUNNER is None:  # pragma: no cover - defensive worker guard
+        raise RuntimeError("factor process worker was not initialized")
+    candidate = FactorCandidateSpec.model_validate(candidate_payload)
+    accepted = {
+        factor_id: FactorCandidateSpec.model_validate(payload)
+        for factor_id, payload in accepted_payload.items()
+    }
+    return _FACTOR_PROCESS_RUNNER._validate_numeric(candidate, accepted)
 
 
 class AgentClient(Protocol):
@@ -336,109 +365,150 @@ class AgentCampaignRunner:
 
     def _run_factor_stage(self, client: AgentClient, state: CampaignState) -> None:
         accepted = self._accepted()
-        while (
-            len(accepted) < self.budgets.factor_target
-            and state.factor_rounds < self.budgets.max_factor_rounds
-            and state.raw_proposals < self.budgets.max_raw_proposals
-        ):
-            iteration = state.factor_rounds + 1
-            count = min(
-                self.budgets.proposals_per_round,
-                self.budgets.max_raw_proposals - state.raw_proposals,
-            )
-            round_path = self.run_dir / "factor_rounds" / f"{iteration:04d}.json"
-            round_cached = round_path.exists()
-            if round_cached:
-                cached = json.loads(round_path.read_text(encoding="utf-8"))
-                hypotheses = tuple(
-                    ResearchHypothesis.model_validate(item) for item in cached["hypotheses"]
+        pool = self._make_factor_pool()
+        try:
+            while (
+                len(accepted) < self.budgets.factor_target
+                and state.factor_rounds < self.budgets.max_factor_rounds
+                and state.raw_proposals < self.budgets.max_raw_proposals
+            ):
+                iteration = state.factor_rounds + 1
+                count = min(
+                    self.budgets.proposals_per_round,
+                    self.budgets.max_raw_proposals - state.raw_proposals,
                 )
-                candidates = tuple(
-                    FactorCandidateSpec.model_validate(item) for item in cached["candidates"]
-                )
-            else:
-                hypotheses, candidates, audit = client.propose_factors(
-                    context=self._agent_context(), count=count, iteration=iteration
-                )
-                atomic_write_json(round_path, {
-                    "iteration": iteration,
-                    "hypotheses": [item.model_dump(mode="json") for item in hypotheses],
-                    "candidates": [item.model_dump(mode="json") for item in candidates],
-                }, immutable=True)
-                self._append_jsonl("agent_calls.jsonl", redact_payload({
-                    **audit, "phase": "factor_discovery", "iteration": iteration,
-                }))
-            if not round_cached:
-                for hypothesis in hypotheses:
-                    self._append_jsonl("hypotheses.jsonl", hypothesis.model_dump(mode="json"))
-            reserved: set[str] = set()
-            recorded_ids = {
-                FactorCandidateSpec.model_validate(row["candidate"]).factor_id
-                for row in self._read_jsonl("factor_proposals.jsonl")
-                if "candidate" in row
-            } | set(accepted)
-            pending: list[
-                tuple[FactorCandidateSpec, dict[str, Any], Future[dict[str, Any]]]
-            ] = []
-            pool = ThreadPoolExecutor(
-                max_workers=min(self.config.resources.factor_workers, count)
-            )
-            for candidate in candidates[:count]:
-                if candidate.factor_id in recorded_ids:
-                    continue
-                state.raw_proposals += 1
-                record: dict[str, Any] = {
-                    "proposal_number": state.raw_proposals,
-                    "iteration": iteration,
-                    "candidate": candidate.model_dump(mode="json"),
-                }
-                try:
-                    candidate.expression.validate_contract(set(self.config.allowed_fields))
-                    if candidate.factor_id in accepted or candidate.factor_id in reserved:
-                        raise ValueError("exact_canonical_duplicate")
-                    reserved.add(candidate.factor_id)
-                    pending.append((
-                        candidate,
-                        record,
-                        pool.submit(self._validate_numeric, candidate, dict(accepted)),
-                    ))
-                except Exception as exc:
-                    record.update({
-                        "status": "rejected", "reason": str(exc),
-                        "error_type": type(exc).__name__,
-                    })
+                round_path = self.run_dir / "factor_rounds" / f"{iteration:04d}.json"
+                round_cached = round_path.exists()
+                if round_cached:
+                    cached = json.loads(round_path.read_text(encoding="utf-8"))
+                    hypotheses = tuple(
+                        ResearchHypothesis.model_validate(item)
+                        for item in cached["hypotheses"]
+                    )
+                    candidates = tuple(
+                        FactorCandidateSpec.model_validate(item)
+                        for item in cached["candidates"]
+                    )
+                else:
+                    hypotheses, candidates, audit = client.propose_factors(
+                        context=self._agent_context(), count=count, iteration=iteration
+                    )
+                    atomic_write_json(round_path, {
+                        "iteration": iteration,
+                        "hypotheses": [item.model_dump(mode="json") for item in hypotheses],
+                        "candidates": [item.model_dump(mode="json") for item in candidates],
+                    }, immutable=True)
+                    self._append_jsonl("agent_calls.jsonl", redact_payload({
+                        **audit, "phase": "factor_discovery", "iteration": iteration,
+                    }))
+                if not round_cached:
+                    for hypothesis in hypotheses:
+                        self._append_jsonl(
+                            "hypotheses.jsonl", hypothesis.model_dump(mode="json")
+                        )
+                reserved: set[str] = set()
+                recorded_ids = {
+                    FactorCandidateSpec.model_validate(row["candidate"]).factor_id
+                    for row in self._read_jsonl("factor_proposals.jsonl")
+                    if "candidate" in row
+                } | set(accepted)
+                pending: list[
+                    tuple[FactorCandidateSpec, dict[str, Any], Future[dict[str, Any]]]
+                ] = []
+                for candidate in candidates[:count]:
+                    if candidate.factor_id in recorded_ids:
+                        continue
+                    state.raw_proposals += 1
+                    record: dict[str, Any] = {
+                        "proposal_number": state.raw_proposals,
+                        "iteration": iteration,
+                        "candidate": candidate.model_dump(mode="json"),
+                    }
+                    try:
+                        candidate.expression.validate_contract(
+                            set(self.config.allowed_fields)
+                        )
+                        if candidate.factor_id in accepted or candidate.factor_id in reserved:
+                            raise ValueError("exact_canonical_duplicate")
+                        reserved.add(candidate.factor_id)
+                        pending.append((
+                            candidate,
+                            record,
+                            self._submit_factor_validation(pool, candidate, accepted),
+                        ))
+                    except Exception as exc:
+                        record.update({
+                            "status": "rejected", "reason": str(exc),
+                            "error_type": type(exc).__name__,
+                        })
+                        self._append_jsonl("factor_proposals.jsonl", record)
+                        self._save_state(state)
+                for candidate, record, future in pending:
+                    try:
+                        validation = future.result()
+                        novelty = self._accepted_shard_novelty(candidate, accepted)
+                        if novelty["maximum_absolute_correlation"] > validation.get(
+                            "maximum_absolute_correlation", 0.0
+                        ):
+                            validation.update(novelty)
+                        if validation.get("maximum_absolute_correlation", 0.0) >= (
+                            self.config.exact_duplicate_correlation
+                        ):
+                            raise ValueError("numeric_duplicate_correlation")
+                        record.update({"status": "accepted", "validation": validation})
+                        accepted[candidate.factor_id] = candidate
+                        self._append_jsonl("accepted_factors.jsonl", {
+                            "factor_id": candidate.factor_id,
+                            "candidate": candidate.model_dump(mode="json"),
+                            "validation": validation,
+                        })
+                    except BrokenProcessPool as exc:
+                        raise RuntimeError(
+                            "factor process pool failed; the round remains resumable"
+                        ) from exc
+                    except Exception as exc:
+                        record.update({
+                            "status": "rejected", "reason": str(exc),
+                            "error_type": type(exc).__name__,
+                        })
                     self._append_jsonl("factor_proposals.jsonl", record)
                     self._save_state(state)
-            pool.shutdown(wait=True)
-            for candidate, record, future in pending:
-                try:
-                    validation = future.result()
-                    novelty = self._accepted_shard_novelty(candidate, accepted)
-                    if novelty["maximum_absolute_correlation"] > validation.get(
-                        "maximum_absolute_correlation", 0.0
-                    ):
-                        validation.update(novelty)
-                    if validation.get("maximum_absolute_correlation", 0.0) >= (
-                        self.config.exact_duplicate_correlation
-                    ):
-                        raise ValueError("numeric_duplicate_correlation")
-                    record.update({"status": "accepted", "validation": validation})
-                    accepted[candidate.factor_id] = candidate
-                    self._append_jsonl("accepted_factors.jsonl", {
-                        "factor_id": candidate.factor_id,
-                        "candidate": candidate.model_dump(mode="json"),
-                        "validation": validation,
-                    })
-                except Exception as exc:
-                    record.update({
-                        "status": "rejected", "reason": str(exc),
-                        "error_type": type(exc).__name__,
-                    })
-                self._append_jsonl("factor_proposals.jsonl", record)
+                state.factor_rounds = iteration
+                state.accepted_unique_factors = len(accepted)
                 self._save_state(state)
-            state.factor_rounds = iteration
-            state.accepted_unique_factors = len(accepted)
-            self._save_state(state)
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    def _make_factor_pool(self) -> ThreadPoolExecutor | ProcessPoolExecutor:
+        workers = min(
+            self.config.resources.factor_workers,
+            self.budgets.proposals_per_round,
+        )
+        if self.config.resources.factor_execution_mode == "process":
+            return ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize_factor_process,
+                initargs=(self.plan.model_dump(mode="json"), str(self.run_dir)),
+            )
+        return ThreadPoolExecutor(max_workers=workers)
+
+    def _submit_factor_validation(
+        self,
+        pool: ThreadPoolExecutor | ProcessPoolExecutor,
+        candidate: FactorCandidateSpec,
+        accepted: dict[str, FactorCandidateSpec],
+    ) -> Future[dict[str, Any]]:
+        if self.config.resources.factor_execution_mode == "process":
+            return pool.submit(
+                _validate_numeric_in_process,
+                candidate.model_dump(mode="json"),
+                {
+                    factor_id: spec.model_dump(mode="json")
+                    for factor_id, spec in accepted.items()
+                },
+            )
+        return pool.submit(self._validate_numeric, candidate, dict(accepted))
 
     def _run_experiment_stage(
         self, client: AgentClient, executor: ZyQuantExperimentExecutor,

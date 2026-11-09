@@ -160,7 +160,9 @@ class ResourceGuards(BaseModel):
 
     minimum_free_gb: float = Field(default=100.0, ge=0.0)
     minimum_free_memory_gb: float = Field(default=50.0, ge=0.0)
+    capacity_profile: Literal["standard", "single_host_legacy"] = "standard"
     factor_workers: int = Field(default=12, ge=1, le=24)
+    factor_execution_mode: Literal["thread", "process"] = "thread"
     model_workers: int = Field(default=3, ge=1, le=4)
     threads_per_model: int = Field(default=16, ge=1, le=20)
 
@@ -285,14 +287,30 @@ class AgentResearchConfig(BaseModel):
             or self.resources.threads_per_model > 20
         ):
             raise ValueError("CSI300 resources exceed the registered disk/12/3/20 limits")
-        if self.pool_id == "CSI1000" and (
-            self.resources.minimum_free_gb < 200
-            or self.resources.minimum_free_memory_gb < 50
-            or self.resources.factor_workers > 24
-            or self.resources.model_workers > 4
-            or self.resources.threads_per_model > 16
-        ):
-            raise ValueError("CSI1000 resources exceed the registered disk/memory/24/4/16 limits")
+        if self.pool_id == "CSI1000":
+            resources = self.resources
+            if resources.capacity_profile == "standard" and (
+                resources.minimum_free_gb < 200
+                or resources.minimum_free_memory_gb < 50
+                or resources.factor_workers > 24
+                or resources.model_workers > 4
+                or resources.threads_per_model > 16
+            ):
+                raise ValueError(
+                    "CSI1000 resources: standard profile exceeds the registered "
+                    "disk/memory/24/4/16 limits"
+                )
+            if resources.capacity_profile == "single_host_legacy" and (
+                resources.minimum_free_gb < 100
+                or resources.minimum_free_memory_gb < 8
+                or resources.factor_workers > 12
+                or resources.model_workers > 3
+                or resources.threads_per_model > 16
+            ):
+                raise ValueError(
+                    "CSI1000 single-host resources exceed the registered "
+                    "disk/memory/12/3/16 limits"
+                )
         return self
 
 

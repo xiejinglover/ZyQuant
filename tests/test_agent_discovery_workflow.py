@@ -142,6 +142,34 @@ def test_replay_workflow_is_content_addressed_and_resume_is_idempotent(tmp_path:
     assert resumed == result
 
 
+def test_factor_validation_can_use_isolated_process_workers(tmp_path: Path) -> None:
+    replay_path = tmp_path / "replay.json"
+    replay_path.write_text(json.dumps({
+        "factor_rounds": [{"hypotheses": [_hypothesis()], "candidates": [_candidate()]}],
+        "experiments": [],
+    }), encoding="utf-8")
+    config = workflow_config(replay_path)
+    payload = config.model_dump(mode="json")
+    payload["resources"]["factor_execution_mode"] = "process"
+    payload["resources"]["factor_workers"] = 2
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(AgentResearchConfig.model_validate(payload).model_dump(mode="json")),
+        encoding="utf-8",
+    )
+
+    plan_dir, run_dir = tmp_path / "plan", tmp_path / "run"
+    create_agent_plan(config_path, plan_dir)
+    result = run_agent_campaign(plan_dir, run_dir)
+
+    assert result.status == "complete"
+    assert result.accepted_unique_factors == 1
+    proposal = json.loads(
+        (run_dir / "factor_proposals.jsonl").read_text(encoding="utf-8")
+    )
+    assert proposal["status"] == "accepted"
+
+
 def test_agent_context_never_contains_diagnostic_or_reference_evidence(tmp_path: Path) -> None:
     replay_path = tmp_path / "replay.json"
     replay_path.write_text(json.dumps({

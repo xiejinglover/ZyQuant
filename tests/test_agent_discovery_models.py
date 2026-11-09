@@ -122,6 +122,27 @@ def recipe(pool_id: str = "CSI1000") -> ModelRecipeSpec:
     )
 
 
+def test_csi1000_single_host_capacity_profile_is_explicit_and_bounded() -> None:
+    payload = config("CSI1000").model_dump(mode="json")
+    payload["resources"] = ResourceGuards(
+        minimum_free_gb=100,
+        minimum_free_memory_gb=8,
+        capacity_profile="single_host_legacy",
+        factor_workers=12,
+        factor_execution_mode="process",
+        model_workers=3,
+        threads_per_model=16,
+    ).model_dump(mode="json")
+
+    value = AgentResearchConfig.model_validate(payload)
+    assert value.resources.capacity_profile == "single_host_legacy"
+    assert value.resources.factor_execution_mode == "process"
+
+    payload["resources"]["factor_workers"] = 13
+    with pytest.raises(ValidationError, match="single-host resources"):
+        AgentResearchConfig.model_validate(payload)
+
+
 def experiment() -> JointExperimentSpec:
     return JointExperimentSpec(
         campaign_id="csi1000-agent-v1",
