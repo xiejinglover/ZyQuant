@@ -1022,15 +1022,12 @@ def _median_cross_sectional_spearman_many(
 
     correlations: dict[str, list[float]] = {right: [] for right in rights}
     for _, group in frame.groupby("trade_date", sort=False):
-        for right in rights:
-            valid = group[[left, right]].dropna()
-            if (
-                len(valid) < 3
-                or valid[left].nunique() < 2
-                or valid[right].nunique() < 2
-            ):
-                continue
-            value = valid[left].corr(valid[right], method="spearman")
+        # ``corrwith`` preserves pandas' exact pairwise-NA Spearman semantics while
+        # avoiding one DataFrame slice, ``dropna`` and Python correlation call for
+        # every baseline factor on every date.  That overhead dominates a campaign
+        # with hundreds of baseline factors.
+        values = group.loc[:, rights].corrwith(group[left], method="spearman")
+        for right, value in values.items():
             if pd.notna(value):
                 correlations[right].append(abs(float(value)))
     return {
