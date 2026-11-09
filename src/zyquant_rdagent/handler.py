@@ -205,7 +205,13 @@ class StructuredRDAgentHandler:
         for candidate in candidates:
             if candidate.hypothesis_id not in hypothesis_ids:
                 raise ValueError("candidate references an unknown hypothesis")
-            candidate.expression.validate_contract(allowed_fields)
+            # Keep semantic expression validation in the ZyQuant campaign
+            # workflow.  An LLM proposal can be structurally valid while still
+            # exceeding a contract limit (for example, a 315-day lookback).
+            # Raising here aborts the whole RD-Agent worker and prevents the
+            # workflow from recording that proposal as a normal rejection.
+            # The workflow validates every candidate against the same field,
+            # depth, node, and lookback limits before numeric evaluation.
         self._record(
             trace,
             hypotheses[0],

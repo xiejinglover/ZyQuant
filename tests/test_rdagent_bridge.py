@@ -299,9 +299,23 @@ def test_structured_handler_uses_mock_llm_and_upstream_trace_types() -> None:
                                 "args": [
                                     {
                                         "op": "mean",
-                                        "window": 20,
+                                        # Semantically outside the campaign
+                                        # contract, but still valid structured
+                                        # output. The core workflow must reject
+                                        # it without crashing the Agent worker.
+                                        "window": 200,
                                         "args": [
-                                            {"op": "field", "source": "raw", "field": "volume"}
+                                            {
+                                                "op": "lag",
+                                                "window": 115,
+                                                "args": [
+                                                    {
+                                                        "op": "field",
+                                                        "source": "raw",
+                                                        "field": "volume",
+                                                    }
+                                                ],
+                                            }
                                         ],
                                     },
                                     {
@@ -351,6 +365,8 @@ def test_structured_handler_uses_mock_llm_and_upstream_trace_types() -> None:
     )
     assert hypotheses[0].hypothesis_id == "hyp_0002"
     assert candidates[0].candidate_name == "volume_price_exhaustion"
+    with pytest.raises(ValueError, match="lookback 315 exceeds 252"):
+        candidates[0].expression.validate_contract({"raw.close", "raw.volume"})
     assert audit["response_id"] == "resp_mock"
     assert audit["repair_attempts"] == 1
     assert len(backend.calls) == 2
