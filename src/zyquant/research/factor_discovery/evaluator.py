@@ -135,9 +135,7 @@ class ExpressionEvaluator:
         if op == Operator.RANK:
             return self._group_transform(
                 args[0],
-                lambda x: x.rolling(window, min_periods=window).apply(
-                    lambda values: pd.Series(values).rank(pct=True).iloc[-1], raw=False
-                ),
+                lambda x: self._rolling_last_rank(x, window),
             )
         if op == Operator.EMA:
             return self._group_transform(
@@ -169,3 +167,25 @@ class ExpressionEvaluator:
             series,
             lambda x: getattr(x.rolling(window, min_periods=window), method)(),
         )
+
+    @staticmethod
+    def _rolling_last_rank(series: pd.Series, window: int) -> pd.Series:
+        """Exact pandas-average percentile rank of each rolling window's last value."""
+
+        values = series.to_numpy(dtype=float, copy=False)
+        output = np.full(len(values), np.nan, dtype=float)
+        if len(values) < window:
+            return pd.Series(output, index=series.index)
+        windows = np.lib.stride_tricks.sliding_window_view(values, window)
+        valid = np.isfinite(windows).all(axis=1)
+        if valid.any():
+            current = windows[valid]
+            last = current[:, -1, None]
+            less = np.count_nonzero(current < last, axis=1)
+            equal = np.count_nonzero(current == last, axis=1)
+            # pandas rank(method="average", pct=True) is one-based average
+            # rank divided by the number of finite observations.
+            output[np.flatnonzero(valid) + window - 1] = (
+                less + (equal + 1.0) / 2.0
+            ) / window
+        return pd.Series(output, index=series.index)

@@ -110,6 +110,36 @@ def test_evaluator_materializes_only_expression_leaves():
     assert result["value"].tolist() == [1.0, 2.0]
 
 
+def test_vectorized_rolling_rank_matches_pandas_average_pct_reference():
+    days = pd.date_range("2026-01-01", periods=8, tz="Asia/Shanghai")
+    frame = pd.DataFrame({
+        "trade_date": list(days) * 2,
+        "instrument_id": ["A"] * 8 + ["B"] * 8,
+        "value": [1.0, 2.0, 2.0, 4.0, np.nan, 3.0, 3.0, 5.0,
+                  8.0, 7.0, 7.0, 6.0, 5.0, 5.0, 4.0, 3.0],
+    })
+    spec = ExpressionSpec.model_validate({
+        "op": "rank", "window": 4, "args": [FIELD_CLOSE],
+    })
+
+    actual = ExpressionEvaluator({"post_adjusted.close"}).evaluate(
+        spec, {"post_adjusted.close": frame}
+    )
+    reference = frame.groupby("instrument_id", group_keys=False, sort=False)["value"].apply(
+        lambda values: values.rolling(4, min_periods=4).apply(
+            lambda window: pd.Series(window).rank(method="average", pct=True).iloc[-1],
+            raw=False,
+        )
+    )
+    expected = frame[["trade_date", "instrument_id"]].copy()
+    expected["value"] = reference
+    expected = expected.sort_values(["trade_date", "instrument_id"]).reset_index(drop=True)
+
+    assert actual["value"].to_numpy() == pytest.approx(
+        expected["value"].to_numpy(), nan_ok=True
+    )
+
+
 def _evidence_tables(decisions=40, instruments=40):
     rows = []
     values = []
