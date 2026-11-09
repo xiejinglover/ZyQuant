@@ -407,6 +407,7 @@ class AgentCampaignRunner:
                             "hypotheses.jsonl", hypothesis.model_dump(mode="json")
                         )
                 reserved: set[str] = set()
+                accepted_at_round_start = set(accepted)
                 recorded_ids = {
                     FactorCandidateSpec.model_validate(row["candidate"]).factor_id
                     for row in self._read_jsonl("factor_proposals.jsonl")
@@ -446,7 +447,18 @@ class AgentCampaignRunner:
                 for candidate, record, future in pending:
                     try:
                         validation = future.result()
-                        novelty = self._accepted_shard_novelty(candidate, accepted)
+                        # The worker already compared against every factor accepted
+                        # before this round.  Recheck only factors accepted earlier
+                        # in the same concurrent batch; scanning the full library
+                        # here made the coordinator repeat O(rounds^2) work.
+                        same_round_accepted = {
+                            factor_id: spec
+                            for factor_id, spec in accepted.items()
+                            if factor_id not in accepted_at_round_start
+                        }
+                        novelty = self._accepted_shard_novelty(
+                            candidate, same_round_accepted
+                        )
                         if novelty["maximum_absolute_correlation"] > validation.get(
                             "maximum_absolute_correlation", 0.0
                         ):
@@ -808,19 +820,33 @@ class AgentCampaignRunner:
     ) -> dict[str, Any]:
         factor_dir = self.run_dir / "factor_shards"
         sample = pd.read_parquet(factor_dir / f"{candidate.factor_id}.parquet")
-        nearest_id: str | None = None
-        nearest = 0.0
+        decision_dates = tuple(sorted(sample["trade_date"].drop_duplicates()))
+        cap = self.config.evidence.valid_decision_cap
+        if cap is not None and len(decision_dates) > cap:
+            positions = np.linspace(0, len(decision_dates) - 1, cap, dtype=int)
+            decision_dates = tuple(decision_dates[position] for position in positions)
+        sample = sample[sample["trade_date"].isin(decision_dates)]
+        rights: list[str] = []
         for factor_id in accepted:
             path = factor_dir / f"{factor_id}.parquet"
             if not path.exists():
                 continue
             other = pd.read_parquet(path)
-            merged = sample.merge(other, on=["trade_date", "instrument_id"], how="inner")
-            if len(merged) < 3:
-                continue
-            absolute = _median_cross_sectional_spearman(
-                merged, candidate.factor_id, factor_id
+            other = other[other["trade_date"].isin(decision_dates)]
+            sample = sample.merge(
+                other, on=["trade_date", "instrument_id"], how="left"
             )
+            rights.append(factor_id)
+        correlations = (
+            _median_cross_sectional_spearman_many(
+                sample, candidate.factor_id, tuple(rights)
+            )
+            if rights and len(sample) >= 3
+            else {}
+        )
+        nearest_id: str | None = None
+        nearest = 0.0
+        for factor_id, absolute in correlations.items():
             if absolute > nearest:
                 nearest, nearest_id = absolute, factor_id
         return {
