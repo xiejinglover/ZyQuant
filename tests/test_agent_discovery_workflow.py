@@ -20,6 +20,8 @@ from zyquant.research.agent_discovery import (
 from zyquant.research.agent_discovery.executor import atomic_write_json, redact_payload
 from zyquant.research.agent_discovery.report import verify_agent_campaign
 from zyquant.research.agent_discovery.workflow import (
+    _median_cross_sectional_spearman,
+    _median_cross_sectional_spearman_many,
     create_agent_plan,
     resume_agent_campaign,
     run_agent_campaign,
@@ -222,3 +224,23 @@ def test_redaction_preserves_usage_counts_but_removes_credentials() -> None:
     assert payload["access_token"] == "[REDACTED]"
     assert payload["nested"]["openai_api_key"] == "[REDACTED]"
     assert payload["non_finite"] is None
+
+
+def test_batched_spearman_matches_pairwise_reference_with_missing_values() -> None:
+    frame = pd.DataFrame({
+        "trade_date": pd.to_datetime([
+            "2024-01-02", "2024-01-02", "2024-01-02", "2024-01-02",
+            "2024-01-03", "2024-01-03", "2024-01-03", "2024-01-03",
+        ]),
+        "candidate": [1.0, 2.0, 2.0, 4.0, 4.0, 3.0, 2.0, 1.0],
+        "baseline_a": [1.0, 2.0, 3.0, 4.0, 1.0, float("nan"), 3.0, 4.0],
+        "baseline_b": [4.0, 3.0, float("nan"), 1.0, 4.0, 3.0, 2.0, 1.0],
+    })
+    rights = ("baseline_a", "baseline_b")
+
+    batched = _median_cross_sectional_spearman_many(frame, "candidate", rights)
+
+    assert batched == pytest.approx({
+        right: _median_cross_sectional_spearman(frame, "candidate", right)
+        for right in rights
+    })

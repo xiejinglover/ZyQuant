@@ -674,22 +674,33 @@ class AgentCampaignRunner:
             load_many(baseline_fields, decision_dates)
             if callable(load_many) and baseline_fields else None
         )
-        for factor_id, field_name in baseline_pairs:
-            if baseline_matrix is not None:
-                other = baseline_matrix[["trade_date", "instrument_id", field_name]].rename(
-                    columns={field_name: factor_id}
-                )
-            else:
+        if baseline_matrix is not None:
+            merged = novelty_sample.merge(
+                baseline_matrix,
+                on=["trade_date", "instrument_id"],
+                how="inner",
+            )
+            correlations = _median_cross_sectional_spearman_many(
+                merged,
+                candidate.factor_id,
+                baseline_fields,
+            )
+            for factor_id, field_name in baseline_pairs:
+                absolute = correlations[field_name]
+                if absolute > nearest:
+                    nearest, nearest_id = absolute, factor_id
+        else:
+            for factor_id, field_name in baseline_pairs:
                 other = dataset.fields[field_name].rename(columns={"value": factor_id})
                 other = other[other["trade_date"].isin(decision_dates)]
-            merged = novelty_sample.merge(
-                other, on=["trade_date", "instrument_id"], how="inner"
-            )
-            absolute = _median_cross_sectional_spearman(
-                merged, candidate.factor_id, factor_id
-            )
-            if absolute > nearest:
-                nearest, nearest_id = absolute, factor_id
+                merged = novelty_sample.merge(
+                    other, on=["trade_date", "instrument_id"], how="inner"
+                )
+                absolute = _median_cross_sectional_spearman(
+                    merged, candidate.factor_id, factor_id
+                )
+                if absolute > nearest:
+                    nearest, nearest_id = absolute, factor_id
         evidence = self._candidate_evidence(candidate, values, dataset)
         return {
             "finite_values": int(finite.notna().sum()),
@@ -1000,6 +1011,32 @@ def _median_cross_sectional_spearman(
         if pd.notna(value):
             correlations.append(abs(float(value)))
     return float(np.median(correlations)) if correlations else 0.0
+
+
+def _median_cross_sectional_spearman_many(
+    frame: pd.DataFrame,
+    left: str,
+    rights: tuple[str, ...],
+) -> dict[str, float]:
+    """Compute many exact pairwise Spearman medians after one key merge/groupby."""
+
+    correlations: dict[str, list[float]] = {right: [] for right in rights}
+    for _, group in frame.groupby("trade_date", sort=False):
+        for right in rights:
+            valid = group[[left, right]].dropna()
+            if (
+                len(valid) < 3
+                or valid[left].nunique() < 2
+                or valid[right].nunique() < 2
+            ):
+                continue
+            value = valid[left].corr(valid[right], method="spearman")
+            if pd.notna(value):
+                correlations[right].append(abs(float(value)))
+    return {
+        right: float(np.median(values)) if values else 0.0
+        for right, values in correlations.items()
+    }
 
 
 def _require_new_or_empty(path: Path) -> None:
