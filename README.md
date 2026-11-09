@@ -1,5 +1,10 @@
 # ZyQuant
 
+ZyQuant 2.2 adds an optional, process-isolated RD-Agent research workflow for
+structured factor and model experiments without Qlib. It keeps the safe factor
+AST, PIT evidence, frozen annual vintages, and formal-account adapters under
+ZyQuant control. See [the RD-Agent guide](docs/rdagent-research.md).
+
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Tests](https://github.com/xiejinglover/ZyQuant/actions/workflows/test.yml/badge.svg)](https://github.com/xiejinglover/ZyQuant/actions/workflows/test.yml)
 
@@ -10,7 +15,7 @@ ZyQuant 是面向中国股票和 ETF 日频研究的轻量量化框架。核心�
 - 因子、模型、策略、回测和实验产物全部绑定不可变数据快照；
 - 多策略通过虚拟袖套核算，在主账户层执行订单净额化。
 
-当前版本为 `2.0.11`，实现了架构文档定义的完整单机日频研究基线：
+当前版本为 `2.2.0`，实现了架构文档定义的完整单机日频研究基线：
 
 - v1 manifest、lineage、质量报告、严格 PIT 查询与原始/后复权价格防火墙；
 - 声明式因子 DAG、内容缓存、ML 数据集/滚动训练/模型登记；
@@ -19,18 +24,20 @@ ZyQuant 是面向中国股票和 ETF 日频研究的轻量量化框架。核心�
 - 标准账本、绩效/归因、原子实验产物与多进程搜索。
 - 可选的版本化财务报表、基本面指标、每日估值和历史股本 PIT 数据。
 - Hermes 只读断点采集、沪深北 A 股、配股复权、流式标准化与原子发布。
+- 可选 LLM 因子发现、安全表达式执行、冻结研究计划和滚动因子证据报告。
+- 可选 RD-Agent 因子与模型联合研究，通过隔离进程运行且不依赖 Qlib。
 
 ## 安装
 
 需要 Python 3.11 或更高版本。普通用户建议在独立虚拟环境中直接安装
-[GitHub Release](https://github.com/xiejinglover/ZyQuant/releases/tag/v2.0.11) 的 wheel：
+[GitHub Release](https://github.com/xiejinglover/ZyQuant/releases/tag/v2.2.0) 的 wheel：
 
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install \
-  "https://github.com/xiejinglover/ZyQuant/releases/download/v2.0.11/zyquant-2.0.11-py3-none-any.whl"
+  "https://github.com/xiejinglover/ZyQuant/releases/download/v2.2.0/zyquant-2.2.0-py3-none-any.whl"
 ```
 
 验证安装：
@@ -45,11 +52,12 @@ zyq data sources
 连接器代码；只有实际使用的供应商 SDK 需要通过 extra 安装：
 
 ```bash
-WHEEL_URL="https://github.com/xiejinglover/ZyQuant/releases/download/v2.0.11/zyquant-2.0.11-py3-none-any.whl"
+WHEEL_URL="https://github.com/xiejinglover/ZyQuant/releases/download/v2.2.0/zyquant-2.2.0-py3-none-any.whl"
 
 python -m pip install "zyquant[hermes] @ ${WHEEL_URL}"
 python -m pip install "zyquant[jqdata] @ ${WHEEL_URL}"
 python -m pip install "zyquant[sql] @ ${WHEEL_URL}"
+python -m pip install "zyquant[ai] @ ${WHEEL_URL}"
 # 一次安装全部可选连接器：
 python -m pip install "zyquant[connectors] @ ${WHEEL_URL}"
 ```
@@ -69,7 +77,7 @@ python -m pytest -q
 JQData 适配器保留用于显式的小样本数据发布，凭据只从环境变量读取：
 
 ```bash
-WHEEL_URL="https://github.com/xiejinglover/ZyQuant/releases/download/v2.0.11/zyquant-2.0.11-py3-none-any.whl"
+WHEEL_URL="https://github.com/xiejinglover/ZyQuant/releases/download/v2.2.0/zyquant-2.2.0-py3-none-any.whl"
 python -m pip install "zyquant[jqdata] @ ${WHEEL_URL}"
 export JQDATA_USERNAME='<account>'
 export JQDATA_PASSWORD='<password>'

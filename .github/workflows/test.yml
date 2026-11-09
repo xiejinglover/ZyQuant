@@ -22,3 +22,21 @@ jobs:
       - run: mypy src/zyquant
       - run: python -m pip check
       - run: python -m pip wheel . --no-deps -w dist
+
+  agent-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install '.[dev,agent]'
+      - run: python -m pytest -q tests/test_agent_discovery_models.py tests/test_agent_discovery_workflow.py tests/test_agent_discovery_cli.py tests/test_rdagent_bridge.py
+      - name: Assert Qlib is absent
+        run: python -c "import importlib.util; assert importlib.util.find_spec('qlib') is None"
+      - name: Reject Qlib imports in integration sources
+        run: |
+          if grep -R -n -E '^[[:space:]]*(from|import)[[:space:]]+(qlib|rdagent\.app\.qlib|rdagent\.utils\.qlib)' src/zyquant/research/agent_discovery src/zyquant_rdagent; then
+            exit 1
+          fi

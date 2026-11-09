@@ -81,6 +81,43 @@ def parser() -> argparse.ArgumentParser:
         current = factor_commands.add_parser(action)
         current.add_argument("--config", required=True, type=Path)
         current.add_argument("--project-root", type=Path, default=Path.cwd())
+    discover = factor_commands.add_parser(
+        "discover", help="legacy v2.1 LLM campaign replay and reporting"
+    )
+    discover_commands = discover.add_subparsers(dest="discover_command", required=True)
+    discover_plan = discover_commands.add_parser("plan")
+    discover_plan.add_argument("--config", required=True, type=Path)
+    discover_plan.add_argument("--output-dir", required=True, type=Path)
+    discover_run = discover_commands.add_parser("run")
+    discover_run.add_argument("--plan-dir", required=True, type=Path)
+    discover_run.add_argument("--output-dir", required=True, type=Path)
+    discover_resume = discover_commands.add_parser("resume")
+    discover_resume.add_argument("--plan-dir", required=True, type=Path)
+    discover_resume.add_argument("--run-dir", required=True, type=Path)
+    discover_report = discover_commands.add_parser("report")
+    discover_report.add_argument("--run-dir", required=True, type=Path)
+
+    research = commands.add_parser("research", help="run auditable research campaigns")
+    research_commands = research.add_subparsers(dest="research_command", required=True)
+    agent = research_commands.add_parser(
+        "agent", help="plan, run, resume, report, or verify an RD-Agent campaign"
+    )
+    agent_commands = agent.add_subparsers(dest="agent_command", required=True)
+    agent_plan = agent_commands.add_parser("plan")
+    agent_plan.add_argument("--config", required=True, type=Path)
+    agent_plan.add_argument("--output-dir", required=True, type=Path)
+    agent_run = agent_commands.add_parser("run")
+    agent_run.add_argument("--plan-dir", required=True, type=Path)
+    agent_run.add_argument("--output-dir", required=True, type=Path)
+    agent_resume = agent_commands.add_parser("resume")
+    agent_resume.add_argument("--run-dir", required=True, type=Path)
+    agent_report = agent_commands.add_parser("report")
+    agent_report.add_argument("--run-dir", required=True, type=Path)
+    agent_verify = agent_commands.add_parser("verify")
+    agent_verify.add_argument("--run-dir", required=True, type=Path)
+    agent_worker = agent_commands.add_parser("worker", help=argparse.SUPPRESS)
+    agent_worker.add_argument("--request", required=True, type=Path)
+    agent_worker.add_argument("--response", required=True, type=Path)
 
     model = commands.add_parser("model")
     model_commands = model.add_subparsers(dest="model_command", required=True)
@@ -274,7 +311,7 @@ def main(argv=None) -> int:
     try:
         if args.command == "data":
             plugins.discover(kinds=("data",))
-        elif args.command in {"backtest", "factors", "model", "search"}:
+        elif args.command in {"backtest", "factors", "model", "search", "research"}:
             plugins.discover(kinds=(
                 "factors", "models", "optimizers", "objectives",
                 "reports", "execution_models", "cost_models",
@@ -327,6 +364,24 @@ def main(argv=None) -> int:
                     config.output_root, store, args.project_root
                 ).run(config)
             _print({"run_id": result.run_id, "path": result.run_path, "metrics": result.metrics})
+        elif args.command == "factors" and args.factor_command == "discover":
+            from zyquant.research.factor_discovery.workflow import (
+                create_discovery_plan, run_discovery, write_discovery_report,
+            )
+
+            if args.discover_command == "plan":
+                plan = create_discovery_plan(args.config, args.output_dir)
+                _print({"status": "planned", "plan_id": plan.plan_id,
+                        "path": str(args.output_dir.expanduser().resolve())})
+            elif args.discover_command == "run":
+                _print(run_discovery(args.plan_dir, args.output_dir).model_dump(mode="json"))
+            elif args.discover_command == "resume":
+                _print(run_discovery(
+                    args.plan_dir, args.run_dir, resume=True
+                ).model_dump(mode="json"))
+            else:
+                report = write_discovery_report(args.run_dir)
+                _print({"status": "reported", "path": str(report)})
         elif args.command == "factors":
             config = load_config(args.config)
             project_root = args.project_root.expanduser().resolve()
@@ -342,6 +397,38 @@ def main(argv=None) -> int:
                 project_root,
                 mode=args.factor_command,
             ))
+        elif args.command == "research" and args.research_command == "agent":
+            from zyquant.research.agent_discovery.workflow import (
+                create_agent_plan,
+                resume_agent_campaign,
+                run_agent_campaign,
+            )
+            from zyquant.research.agent_discovery.report import (
+                verify_agent_campaign,
+                write_agent_report,
+            )
+
+            if args.agent_command == "plan":
+                plan = create_agent_plan(args.config, args.output_dir)
+                _print({
+                    "status": "planned",
+                    "plan_id": plan.plan_id,
+                    "path": str(args.output_dir.expanduser().resolve()),
+                })
+            elif args.agent_command == "run":
+                _print(run_agent_campaign(
+                    args.plan_dir, args.output_dir
+                ).model_dump(mode="json"))
+            elif args.agent_command == "resume":
+                _print(resume_agent_campaign(args.run_dir).model_dump(mode="json"))
+            elif args.agent_command == "report":
+                report = write_agent_report(args.run_dir)
+                _print({"status": "reported", "path": str(report)})
+            elif args.agent_command == "worker":
+                from zyquant.research.agent_discovery.executor import run_worker_contract
+                _print(run_worker_contract(args.request, args.response))
+            else:
+                _print(verify_agent_campaign(args.run_dir))
         elif args.command == "model" and args.model_command == "train":
             _print(_train_model(args.config, args.project_root))
         elif args.command == "model" and args.model_command == "predict":
